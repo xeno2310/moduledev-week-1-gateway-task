@@ -1,0 +1,92 @@
+﻿{
+    "contract_version":  "course-1",
+    "module":  "payment",
+    "action":  "request",
+    "version":  1,
+    "http_method":  "POST",
+    "target_schema":  "payment",
+    "target_function":  "request_v1",
+    "request_schema":  {
+                           "$schema":  "https://json-schema.org/draft/2020-12/schema",
+                           "$id":  "urn:course:course-1:payment-request-payload",
+                           "type":  "object",
+                           "additionalProperties":  false,
+                           "required":  [
+                                            "operationKind",
+                                            "amount",
+                                            "currency"
+                                        ],
+                           "properties":  {
+                                              "operationKind":  {
+                                                                    "enum":  [
+                                                                                 "PAYMENT_EXECUTION",
+                                                                                 "PAYMENT_APPROVAL"
+                                                                             ]
+                                                                },
+                                              "amount":  {
+                                                             "type":  "string",
+                                                             "pattern":  "^(?:0\\.0[1-9]|0\\.[1-9][0-9]?|[1-9][0-9]{0,15}(?:\\.[0-9]{1,2})?)$"
+                                                         },
+                                              "currency":  {
+                                                               "const":  "RUB"
+                                                           }
+                                          }
+                       },
+    "response_schema":  {
+                            "$schema":  "https://json-schema.org/draft/2020-12/schema",
+                            "$id":  "urn:course:course-1:operation-result",
+                            "type":  "object",
+                            "additionalProperties":  false,
+                            "required":  [
+                                             "operationId",
+                                             "requestId",
+                                             "operationKind",
+                                             "amount",
+                                             "currency",
+                                             "status"
+                                         ],
+                            "properties":  {
+                                               "operationId":  {
+                                                                   "type":  "string",
+                                                                   "format":  "uuid"
+                                                               },
+                                               "requestId":  {
+                                                                 "type":  "string",
+                                                                 "minLength":  1,
+                                                                 "maxLength":  128
+                                                             },
+                                               "operationKind":  {
+                                                                     "enum":  [
+                                                                                  "PAYMENT_EXECUTION",
+                                                                                  "PAYMENT_APPROVAL"
+                                                                              ]
+                                                                 },
+                                               "amount":  {
+                                                              "type":  "string",
+                                                              "pattern":  "^(?:0\\.0[1-9]|0\\.[1-9][0-9]?|[1-9][0-9]{0,15}(?:\\.[0-9]{1,2})?)$"
+                                                          },
+                                               "currency":  {
+                                                                "const":  "RUB"
+                                                            },
+                                               "status":  {
+                                                              "enum":  [
+                                                                           "CREATED",
+                                                                           "PROCESSING",
+                                                                           "COMPLETED",
+                                                                           "REJECTED"
+                                                                       ]
+                                                          }
+                                           }
+                        },
+    "outcomes":  [
+                     "CREATED"
+                 ],
+    "required_policy":  [
+                            "payment:write"
+                        ],
+    "idempotency_mode":  "required",
+    "idempotency_scope":  "principal_action",
+    "timeout_ms":  2000,
+    "enabled":  true,
+    "is_default":  true
+}

@@ -1,0 +1,77 @@
+services:
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: course
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: course-local-only
+    volumes:
+      - course_postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d course"
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Api/Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      COURSE_DB_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=course;
+        Username=course_runtime;
+        Password=course-runtime-local-only
+      COURSE_JWT_ISSUER: moduledev-course
+      COURSE_JWT_AUDIENCE: moduledev-api
+      COURSE_JWT_SIGNING_KEY: moduledev-local-signing-key-not-a-real-secret-123456789
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: .
+      dockerfile: src/Gateway/Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      API_BASE_URL: http://api:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
+  cli:
+    build:
+      context: .
+      dockerfile: src/Cli/Dockerfile
+    environment:
+      COURSE_DB_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=course;
+        Username=course_publication;
+        Password=course-publication-local-only
+      COURSE_MIGRATION_DB_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=course;
+        Username=postgres;
+        Password=course-local-only
+    volumes:
+      - ./db:/app/db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  course_postgres_data:

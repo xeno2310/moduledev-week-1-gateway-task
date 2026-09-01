@@ -235,3 +235,250 @@ Admission checks выполняются до функционального пр
 3. JSON Schema в [`contracts/course-1`](contracts/course-1) определяет точную форму machine payloads и manifest.
 
 Если документы противоречат друг другу, сообщите куратору: это дефект задания, а не повод угадывать поведение проверки.
+
+## Решение
+
+### Архитектура
+
+Решение состоит из четырёх сервисов Docker Compose:
+
+* `gateway` — единственная публичная точка входа. Публикует `http://localhost:8080` и проксирует разрешённые HTTP-маршруты в `api`.
+* `api` — generic action runtime. Проверяет JWT, policy/scopes, версию action, JSON Schema, idempotency и вызывает единственную бизнес-точку входа PostgreSQL `api.invoke(...)`.
+* `cli` — служебный интерфейс для применения миграций и управления action manifests: validate, publish, list, activate и disable.
+* `postgres` — хранит каталог actions, idempotency state, payment operations, operation events и autocheck evidence.
+
+Архитектурные и контрактные материалы:
+
+- [C4 Container diagram](docs/architecture/c4-container.md)
+- [ADR-001: Trust boundary](docs/adr/001-trust-boundary.md)
+- [ADR-002: Technical and domain result](docs/adr/002-technical-domain-result.md)
+- [Action manifest JSON Schema](contracts/course-1/action-manifest.schema.json)
+- [Payment request JSON Schema](contracts/course-1/payment-request.payload.schema.json)
+- [Operation get JSON Schema](contracts/course-1/operation-get.payload.schema.json)
+- [Operation result JSON Schema](contracts/course-1/operation.result.schema.json)
+
+Наружу публикуется только порт `gateway:8080`. `api`, `cli` и `postgres` не публикуют host-порты.
+
+#### C4
+
+Контейнерная схема:
+
+```text
+[Client]
+   |
+   | HTTP :8080
+   v
+[gateway]
+   |
+   | internal HTTP
+   v
+[api]
+   |
+   | PostgreSQL protocol
+   v
+[postgres]
+
+[cli] --------------------> [postgres]
+ migrations / publication
+```
+
+`gateway` не содержит бизнес-логики. `api` не выбирает SQL target из пользовательского payload: target определяется только опубликованным manifest в PostgreSQL. Доменное выполнение проходит через `api.invoke(...)`.
+
+#### Дополнительное решение — PostgreSQL как runtime action catalog
+
+Решение хранит опубликованные action definitions и активную версию в PostgreSQL, а не в коде `gateway` или `api`.
+
+Это позволяет переключать default action version через `cli action activate` без пересборки и без рестарта runtime. OpenAPI также строится из опубликованного каталога и изменяется вместе с активными actions.
+
+#### Дополнительное решение — идемпотентность внутри PostgreSQL
+
+Идемпотентность выполняется внутри транзакции PostgreSQL в `api.invoke(...)`. Для конкурентных одинаковых запросов используется PostgreSQL advisory transaction lock.
+
+Такой подход обеспечивает один доменный side effect даже при нескольких одновременных HTTP-запросах с одинаковым `Idempotency-Key`. Повтор с тем же payload возвращает сохранённый результат, а повтор с другим payload возвращает `idempotency.conflict`.
+
+### Запуск
+
+Для сборки и запуска всего решения:
+
+```bash
+docker compose up -d --build
+```
+
+Публичная точка входа:
+
+```text
+http://localhost:8080
+```
+
+Проверка liveness:
+
+```text
+GET /health/live
+```
+
+Проверка readiness:
+
+```text
+GET /health/ready
+```
+
+OpenAPI активных default actions:
+
+```text
+GET /openapi/default.json
+```
+
+Полная локальная проверка задания:
+
+```bash
+./check.sh
+```
+
+### Конфигурация
+
+Основные переменные окружения API:
+
+```text
+COURSE_DB_CONNECTION
+COURSE_JWT_ISSUER
+COURSE_JWT_AUDIENCE
+COURSE_JWT_SIGNING_KEY
+```
+Основные переменные окружения CLI:
+
+```text
+COURSE_DB_CONNECTION
+COURSE_MIGRATION_DB_CONNECTION
+```
+
+В локальном Docker Compose используются:
+
+```text
+COURSE_JWT_ISSUER=moduledev-course
+COURSE_JWT_AUDIENCE=moduledev-api
+```
+
+`gateway` получает внутренний адрес `api` через `API_BASE_URL`.
+
+Runtime `api` подключается к PostgreSQL от ограниченной роли `course_runtime`. Пользовательский HTTP payload не содержит имени SQL schema/function и не может выбирать исполняемый target.
+
+CLI использует два отдельных подключения к PostgreSQL:
+
+- `COURSE_MIGRATION_DB_CONNECTION` — административное подключение только для `migration apply`;
+- `COURSE_DB_CONNECTION` в сервисе `cli` — подключение роли `course_publication` для `action publish`, `list`, `activate` и `disable`.
+
+Роль `course_publication` имеет доступ к action catalog, но не получает runtime-доступ к предметным таблицам. Для существующих action definitions ей разрешено изменять только операционное состояние `enabled` и `is_default`.
+
+Сервис `api` использует отдельную ограниченную роль `course_runtime` и не имеет migration credentials.
+
+### Миграции
+
+SQL-миграции находятся в:
+
+```text
+db/migrations/
+```
+
+При первом старте чистого PostgreSQL они автоматически применяются через `/docker-entrypoint-initdb.d`, поэтому после:
+
+```bash
+docker compose up -d --build
+```
+
+ручное применение встроенных миграций или публикация `payment.request` / `operation.get` не требуется.
+
+CLI также предоставляет contract-команду checksummed migration runner:
+
+```bash
+docker compose run --rm cli migration apply /app/db/migrations
+```
+
+Она используется для явного применения дополнительных миграций и проверок migration contract.
+
+Migration runner хранит checksum применённой миграции. Повторное применение неизменённой миграции безопасно, а изменение уже применённого файла приводит к conflict.
+
+Основные объекты БД включают:
+
+* action catalog;
+* `api.resolve_action(...)`;
+* `api.invoke(...)`;
+* idempotency records;
+* payment operations;
+* operation events;
+* autocheck evidence views.
+
+### Проверка
+
+Основная проверка:
+
+```bash
+./check.sh
+```
+
+Дополнительные ручные проверки:
+
+```text
+http://localhost:8080/health/live
+http://localhost:8080/health/ready
+http://localhost:8080/openapi/default.json
+```
+
+В решении проверены:
+
+* JWT authentication и malformed/expired tokens;
+* policy/scopes;
+* action version routing;
+* hot switch default version без рестарта;
+* disabled/unknown action;
+* JSON Schema request validation;
+* response contract validation;
+* idempotency replay и conflict;
+* конкурентные одинаковые `payment.request`;
+* `payment.request` и `operation.get`;
+* запрет прямой мутации runtime-проекций;
+* recovery после пересоздания `api` и `gateway`;
+* недоступность `postgres` и восстановление readiness.
+
+### Диагностика
+
+Состояние сервисов:
+
+```bash
+docker compose ps
+```
+
+Логи:
+
+```bash
+docker compose logs gateway api
+```
+
+Проверка API:
+
+```text
+GET http://localhost:8080/health/live
+GET http://localhost:8080/health/ready
+GET http://localhost:8080/openapi/default.json
+```
+
+Если `/health/live` отвечает `200`, а `/health/ready` не отвечает `200`, процесс `gateway` работает, но downstream dependency (`api` или `postgres`) недоступна.
+
+Для диагностики каталога actions можно использовать:
+
+```bash
+docker compose run --rm cli action list
+```
+
+Для диагностики PostgreSQL:
+
+```bash
+docker compose exec -T postgres psql -U postgres -d course
+```
+
+### Ограничения
+
+* Локальные credentials и signing key в Compose предназначены только для учебного окружения и не должны использоваться как production secrets.
+* JWT реализован для контракта задания с HS256; production-система обычно использовала бы внешний identity provider и управляемую ротацию ключей.
+* Система реализует только actions, необходимые контракту `course-1`.
+* OpenAPI генерируется из опубликованного action catalog и описывает runtime-контракт, а не произвольные дополнительные HTTP endpoints.
+* PostgreSQL является обязательной dependency для action runtime; при его недоступности readiness становится unhealthy, а action execution возвращает `dependency.unavailable`.
