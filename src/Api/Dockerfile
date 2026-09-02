@@ -28,4 +28,6 @@ ENV ASPNETCORE_URLS=http://+:8080
 
 EXPOSE 8080
 
+USER $APP_UID
+
 ENTRYPOINT ["dotnet", "Api.dll"]

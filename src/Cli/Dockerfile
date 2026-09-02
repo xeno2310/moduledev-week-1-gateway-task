@@ -25,4 +25,6 @@ WORKDIR /app
 COPY --from=build /app/publish .
 
 COPY --from=build /src/contracts/course-1/action-manifest.schema.json /app/contracts/course-1/action-manifest.schema.json
+
+USER $APP_UID
 ENTRYPOINT ["dotnet", "Cli.dll"]

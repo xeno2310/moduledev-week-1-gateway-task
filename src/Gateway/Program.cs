@@ -46,23 +46,16 @@ app.MapGet("/health/ready", async (IHttpClientFactory factory) =>
     }
 });
 
-var proxyMethods = new[]
-{
-    "GET",
-    "POST",
-    "PUT",
-    "PATCH",
-    "DELETE"
-};
-
-app.MapMethods(
-    "/api/{**path}",
-    proxyMethods,
+app.MapPost(
+    "/api/{module}/{action}",
     ProxyToApi);
 
-app.MapMethods(
-    "/openapi/{**path}",
-    new[] { "GET" },
+app.MapGet(
+    "/openapi/default.json",
+    ProxyToApi);
+
+app.MapGet(
+    "/openapi/actions/{module}/{action}/{version:int}.json",
     ProxyToApi);
 
 app.Run();

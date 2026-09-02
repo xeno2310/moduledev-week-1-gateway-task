@@ -837,6 +837,11 @@ static bool TryReadIdempotencyKey(
 
     key = values[0];
 
+    if (key is { Length: > 128 })
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -1032,7 +1037,7 @@ static IResult ErrorFromAction(
             "idempotency.conflict" => 409,
             "action.contract_violation" => 500,
             "action.timeout" => 504,
-            _ => 400
+            _ => 422
         };
 
     return Results.Json(
@@ -1263,7 +1268,8 @@ static object BuildOpenApiDocument(
                             == "required",
                     schema = new
                     {
-                        type = "string"
+                        type = "string",
+                        maxLength = 128
                     }
                 });
         }
