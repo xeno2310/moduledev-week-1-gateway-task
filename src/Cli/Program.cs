@@ -11,6 +11,11 @@ static async Task<int> RunAsync(string[] args)
 {
     try
     {
+        if (args.Length >= 2 &&
+            args[0] == "flow")
+        {
+            return await WorkflowCli.RunAsync(args);
+        }
         if (args.Length == 3 &&
             args[0] == "migration" &&
             args[1] == "apply")

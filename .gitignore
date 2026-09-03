@@ -8,3 +8,5 @@
 !.env.example
 *.log
 week-1-public-report.json
+.docker/
+week-2-public-report.json

@@ -240,11 +240,12 @@ Admission checks выполняются до функционального пр
 
 ### Архитектура
 
-Решение состоит из четырёх сервисов Docker Compose:
+Решение состоит из шести сервисов Docker Compose: базового action runtime и двух workflow workers.
 
 * `gateway` — единственная публичная точка входа. Публикует `http://localhost:8080` и проксирует разрешённые HTTP-маршруты в `api`.
 * `api` — generic action runtime. Проверяет JWT, policy/scopes, версию action, JSON Schema, idempotency и вызывает единственную бизнес-точку входа PostgreSQL `api.invoke(...)`.
 * `cli` — служебный интерфейс для применения миграций и управления action manifests: validate, publish, list, activate и disable.
+* `worker-a` и `worker-b` — два экземпляра одного generic C# worker image. Конкурентно исполняют automatic workflow jobs через lease/fencing.
 * `postgres` — хранит каталог actions, idempotency state, payment operations, operation events и autocheck evidence.
 
 Архитектурные и контрактные материалы:
@@ -252,12 +253,13 @@ Admission checks выполняются до функционального пр
 - [C4 Container diagram](docs/architecture/c4-container.md)
 - [ADR-001: Trust boundary](docs/adr/001-trust-boundary.md)
 - [ADR-002: Technical and domain result](docs/adr/002-technical-domain-result.md)
+- [ADR-003: Workflow lease and fencing](docs/adr/003-workflow-lease-fencing.md)
 - [Action manifest JSON Schema](contracts/course-1/action-manifest.schema.json)
 - [Payment request JSON Schema](contracts/course-1/payment-request.payload.schema.json)
 - [Operation get JSON Schema](contracts/course-1/operation-get.payload.schema.json)
 - [Operation result JSON Schema](contracts/course-1/operation.result.schema.json)
 
-Наружу публикуется только порт `gateway:8080`. `api`, `cli` и `postgres` не публикуют host-порты.
+Наружу публикуется только порт `gateway:8080`. `api`, `cli`, `worker-a`, `worker-b` и `postgres` не публикуют host-порты.
 
 #### C4
 
@@ -280,6 +282,8 @@ Admission checks выполняются до функционального пр
 
 [cli] --------------------> [postgres]
  migrations / publication
+[worker-a] ---------------> [postgres]
+[worker-b] ---------------> [postgres]
 ```
 
 `gateway` не содержит бизнес-логики. `api` не выбирает SQL target из пользовательского payload: target определяется только опубликованным manifest в PostgreSQL. Доменное выполнение проходит через `api.invoke(...)`.
@@ -329,6 +333,11 @@ GET /openapi/default.json
 ```
 
 Полная локальная проверка задания:
+
+Собственные regression tests Week 2:
+
+    python tests/week2_regression.py
+
 
 ```bash
 ./check.sh
@@ -482,3 +491,15 @@ docker compose exec -T postgres psql -U postgres -d course
 * Система реализует только actions, необходимые контракту `course-1`.
 * OpenAPI генерируется из опубликованного action catalog и описывает runtime-контракт, а не произвольные дополнительные HTTP endpoints.
 * PostgreSQL является обязательной dependency для action runtime; при его недоступности readiness становится unhealthy, а action execution возвращает `dependency.unavailable`.
+
+## Workflow-карты
+
+Workflow-карты описывают versioned process definition: шаги, переходы,
+automatic tasks, wait_signal, manual и end. Карта проходит schema и semantic
+validation перед публикацией; запущенный process закрепляется за своей версией.
+
+## Worker
+
+Worker выполняет automatic steps через lease/fencing, вызывает api.invoke и
+атомарно завершает workflow job. Два экземпляра worker-a и worker-b используют
+один C# image и роль workflow_worker с минимальными EXECUTE-привилегиями.

@@ -1,14 +1,15 @@
 services:
 
   postgres:
-    image: postgres:17
+    build:
+      context: .
+      dockerfile: src/Postgres/Dockerfile
     environment:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: course-local-only
     volumes:
       - course_postgres_data:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:
         [
@@ -67,8 +68,40 @@ services:
         Database=course;
         Username=postgres;
         Password=course-local-only
-    volumes:
-      - ./db:/app/db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  worker-a:
+    image: moduledev-workflow-worker:local
+    build:
+      context: .
+      dockerfile: src/Workflow.Worker/Dockerfile
+    environment:
+      COURSE_DB_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=course;
+        Username=workflow_worker;
+        Password=workflow-worker-local-only
+      WORKER_INSTANCE_ID: worker-a
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-0}"
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker-b:
+    image: moduledev-workflow-worker:local
+    environment:
+      COURSE_DB_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=course;
+        Username=workflow_worker;
+        Password=workflow-worker-local-only
+      WORKER_INSTANCE_ID: worker-b
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-0}"
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
     depends_on:
       postgres:
         condition: service_healthy
