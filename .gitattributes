@@ -1,0 +1,9 @@
+# Keep Linux/container-facing text files stable across Windows checkouts.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sql text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
