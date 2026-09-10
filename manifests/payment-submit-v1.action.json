@@ -1,0 +1,71 @@
+{
+  "action": "submit",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "is_default": true,
+  "module": "payment",
+  "outcomes": [
+    "PROCESSING"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:payment-submit-payload",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "payment:write"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:payment-submit-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "flowName": {
+        "enum": [
+          "payment-processing",
+          "payment-review"
+        ]
+      },
+      "flowVersion": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "processId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "status": {
+        "const": "PROCESSING"
+      }
+    },
+    "required": [
+      "operationId",
+      "processId",
+      "flowName",
+      "flowVersion",
+      "status"
+    ],
+    "type": "object"
+  },
+  "target_function": "submit_v1",
+  "target_schema": "payment",
+  "timeout_ms": 2000,
+  "version": 1
+}

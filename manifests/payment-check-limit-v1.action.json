@@ -1,0 +1,55 @@
+{
+  "action": "check_limit",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "is_default": true,
+  "module": "payment",
+  "outcomes": [
+    "WITHIN_LIMIT",
+    "REVIEW_REQUIRED"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:payment-check-limit-payload",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "payment:internal"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:payment-check-limit-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "ruleVersion": {
+        "const": "course-limit-v1"
+      }
+    },
+    "required": [
+      "operationId",
+      "ruleVersion"
+    ],
+    "type": "object"
+  },
+  "target_function": "check_limit_v1",
+  "target_schema": "payment",
+  "timeout_ms": 2000,
+  "version": 1
+}

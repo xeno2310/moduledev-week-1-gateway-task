@@ -26,6 +26,9 @@ COPY --from=build /app/publish .
 
 COPY --from=build /src/contracts/course-1 /app/contracts/course-1
 COPY --from=build /src/db/migrations /app/db/migrations
+COPY --from=build /src/manifests /app/manifests
+COPY --from=build /src/src/Cli/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod 0555 /app/docker-entrypoint.sh
 
 USER $APP_UID
-ENTRYPOINT ["dotnet", "Cli.dll"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

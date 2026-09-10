@@ -1,0 +1,50 @@
+{
+  "action": "validate",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "is_default": true,
+  "module": "payment",
+  "outcomes": [
+    "VALID"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:payment-validate-payload",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "payment:internal"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:payment-validate-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId"
+    ],
+    "type": "object"
+  },
+  "target_function": "validate_v1",
+  "target_schema": "payment",
+  "timeout_ms": 2000,
+  "version": 1
+}

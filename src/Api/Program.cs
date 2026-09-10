@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Json.Schema;
@@ -28,6 +29,16 @@ var jwtSigningKey =
     builder.Configuration["COURSE_JWT_SIGNING_KEY"]
     ?? throw new InvalidOperationException(
         "COURSE_JWT_SIGNING_KEY is not configured.");
+
+var providerHmacSecret =
+    builder.Configuration["PROVIDER_HMAC_SECRET"];
+
+var providerHmacSecretBytes =
+    string.IsNullOrEmpty(
+        providerHmacSecret)
+        ? Array.Empty<byte>()
+        : Encoding.UTF8.GetBytes(
+            providerHmacSecret);
 
 builder.Services
     .AddAuthentication(
@@ -142,7 +153,8 @@ app.MapPost(
                 http,
                 module,
                 action,
-                connectionString);
+                connectionString,
+                providerHmacSecretBytes);
         })
     .RequireAuthorization();
 
@@ -219,7 +231,8 @@ static async Task<IResult> ExecuteActionAsync(
     HttpContext http,
     string module,
     string action,
-    string connectionString)
+    string connectionString,
+    byte[] providerHmacSecret)
 {
     // Authentication middleware проверил подпись,
     // issuer, audience и lifetime.
@@ -324,15 +337,56 @@ static async Task<IResult> ExecuteActionAsync(
             definition.Version);
     }
 
+    byte[] rawBody;
+
+    try
+    {
+        await using var bodyBuffer =
+            new MemoryStream();
+
+        await http.Request.Body.CopyToAsync(
+            bodyBuffer,
+            http.RequestAborted);
+
+        rawBody =
+            bodyBuffer.ToArray();
+    }
+    catch (OperationCanceledException)
+    {
+        throw;
+    }
+    catch
+    {
+        return Error(
+            400,
+            "request.invalid",
+            "request body could not be read",
+            correlationId,
+            definition.Version);
+    }
+
+    if (!TryVerifyProviderSignature(
+            http,
+            rawBody,
+            providerHmacSecret,
+            out var signatureVerified,
+            out var signatureVersion))
+    {
+        return Error(
+            401,
+            "signature.invalid",
+            "provider signature is invalid",
+            correlationId,
+            definition.Version);
+    }
+
     JsonDocument payload;
 
     try
     {
         payload =
-            await JsonDocument.ParseAsync(
-                http.Request.Body,
-                cancellationToken:
-                    http.RequestAborted);
+            JsonDocument.Parse(
+                rawBody);
     }
     catch (JsonException)
     {
@@ -382,27 +436,52 @@ static async Task<IResult> ExecuteActionAsync(
                     definition.TimeoutMs)
                 .ToString("O");
 
-        var trustedContext =
-            JsonSerializer.Serialize(
-                new
-                {
-                    principal =
-                        identity.Principal,
+        var trustedContextValues =
+            new Dictionary<string, object?>
+            {
+                ["principal"] =
+                    identity.Principal,
 
-                    consumer =
-                        identity.Consumer,
+                ["consumer"] =
+                    identity.Consumer,
 
-                    scopes =
-                        identity.Scopes
-                            .OrderBy(x => x)
-                            .ToArray(),
+                ["scopes"] =
+                    identity.Scopes
+                        .OrderBy(x => x)
+                        .ToArray(),
 
+                ["correlationId"] =
                     correlationId,
 
+                ["requestId"] =
                     requestId,
 
+                ["deadline"] =
                     deadline
-                });
+            };
+
+        if (signatureVerified)
+        {
+            trustedContextValues["transport"] =
+                new
+                {
+                    signatureVerified = true,
+                    signatureVersion
+                };
+        }
+
+        var trustedContext =
+            JsonSerializer.Serialize(
+                trustedContextValues);
+
+        var rawBodySha256 =
+            signatureVerified
+                ? Convert
+                    .ToHexString(
+                        SHA256.HashData(
+                            rawBody))
+                    .ToLowerInvariant()
+                : null;
 
         try
         {
@@ -439,6 +518,30 @@ static async Task<IResult> ExecuteActionAsync(
                             $"{definition.TimeoutMs}ms");
 
                     await timeoutCommand
+                        .ExecuteNonQueryAsync(
+                            http.RequestAborted);
+                }
+
+                if (rawBodySha256 is not null)
+                {
+                    await using var rawBodyCommand =
+                        new NpgsqlCommand(
+                            """
+                            SELECT set_config(
+                                'course.raw_body_sha256',
+                                @raw_body_sha256,
+                                true
+                            );
+                            """,
+                            connection,
+                            transaction);
+
+                    rawBodyCommand.Parameters
+                        .AddWithValue(
+                            "raw_body_sha256",
+                            rawBodySha256);
+
+                    await rawBodyCommand
                         .ExecuteNonQueryAsync(
                             http.RequestAborted);
                 }
@@ -783,6 +886,105 @@ static async Task<ActionDefinition?>
 }
 
 
+static bool TryVerifyProviderSignature(
+    HttpContext http,
+    byte[] rawBody,
+    byte[] providerHmacSecret,
+    out bool verified,
+    out int? version)
+{
+    verified = false;
+    version = null;
+
+    if (!http.Request.Headers.TryGetValue(
+            "X-Provider-Signature",
+            out var values))
+    {
+        // Unsigned requests are still valid at the generic boundary.
+        // Actions which require a signature enforce that requirement
+        // from the trusted transport marker.
+        return true;
+    }
+
+    if (providerHmacSecret.Length == 0)
+    {
+        return false;
+    }
+
+    if (values.Count != 1)
+    {
+        return false;
+    }
+
+    var raw =
+        values[0];
+
+    if (raw is null
+        || raw.Length != 67
+        || !raw.StartsWith(
+            "v1=",
+            StringComparison.Ordinal))
+    {
+        return false;
+    }
+
+    var hex =
+        raw[3..];
+
+    foreach (var character in hex)
+    {
+        var lowerHex =
+            (character >= '0'
+             && character <= '9')
+            || (character >= 'a'
+                && character <= 'f');
+
+        if (!lowerHex)
+        {
+            return false;
+        }
+    }
+
+    byte[] suppliedDigest;
+
+    try
+    {
+        suppliedDigest =
+            Convert.FromHexString(
+                hex);
+    }
+    catch (FormatException)
+    {
+        return false;
+    }
+
+    byte[] expectedDigest;
+
+    using (
+        var hmac =
+            new HMACSHA256(
+                providerHmacSecret))
+    {
+        expectedDigest =
+            hmac.ComputeHash(
+                rawBody);
+    }
+
+    if (!CryptographicOperations
+            .FixedTimeEquals(
+                suppliedDigest,
+                expectedDigest))
+    {
+        return false;
+    }
+
+    verified = true;
+    version = 1;
+
+    return true;
+}
+
+
 static bool TryReadVersion(
     HttpContext http,
     out int? version)
@@ -1033,8 +1235,10 @@ static IResult ErrorFromAction(
         {
             "idempotency.required" => 400,
             "access.denied" => 403,
+            "receipt.signature_required" => 403,
             "action.not_found" => 404,
             "idempotency.conflict" => 409,
+            "workflow.decision_conflict" => 409,
             "action.contract_violation" => 500,
             "action.timeout" => 504,
             _ => 422

@@ -753,8 +753,17 @@ static bool ValidateSchema(
 {
     try
     {
+        var buildOptions =
+            new BuildOptions
+            {
+                SchemaRegistry =
+                    new SchemaRegistry()
+            };
+
         var schema =
-            JsonSchema.FromText(schemaJson);
+            JsonSchema.FromText(
+                schemaJson,
+                buildOptions);
 
         using var document =
             JsonDocument.Parse(

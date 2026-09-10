@@ -1,0 +1,96 @@
+{
+  "action": "manual",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "is_default": true,
+  "module": "workflow",
+  "outcomes": [
+    "APPROVED",
+    "REJECTED"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:workflow-manual-payload",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "APPROVED",
+          "REJECTED"
+        ]
+      },
+      "processId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "reason": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "stepInstanceId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "processId",
+      "stepInstanceId",
+      "decision",
+      "reason"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "workflow:manual"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:workflow-manual-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "APPROVED",
+          "REJECTED"
+        ]
+      },
+      "decisionId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "principal": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "processId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "source": {
+        "const": "MANUAL"
+      },
+      "stepInstanceId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "decisionId",
+      "processId",
+      "stepInstanceId",
+      "decision",
+      "source",
+      "principal"
+    ],
+    "type": "object"
+  },
+  "target_function": "manual_v1",
+  "target_schema": "workflow",
+  "timeout_ms": 2000,
+  "version": 1
+}

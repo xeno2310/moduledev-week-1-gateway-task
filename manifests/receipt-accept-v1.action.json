@@ -1,0 +1,108 @@
+{
+  "action": "accept",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "required",
+  "idempotency_scope": "global_action",
+  "is_default": true,
+  "module": "receipt",
+  "outcomes": [
+    "RECEIVED",
+    "DUPLICATE"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:receipt-v1",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "externalRequestId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "type": "string"
+      },
+      "messageId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "type": "string"
+      },
+      "occurredAt": {
+        "format": "date-time",
+        "maxLength": 64,
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "pattern": "Z$",
+        "type": "string"
+      },
+      "outcome": {
+        "enum": [
+          "COMPLETED",
+          "REJECTED"
+        ]
+      },
+      "providerPaymentId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "type": "string"
+      },
+      "version": {
+        "const": 1
+      }
+    },
+    "required": [
+      "externalRequestId",
+      "messageId",
+      "occurredAt",
+      "outcome",
+      "providerPaymentId",
+      "version"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "receipt:write"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:receipt-accept-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "externalRequestId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "messageId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "state": {
+        "enum": [
+          "RECEIVED",
+          "APPLIED"
+        ]
+      }
+    },
+    "required": [
+      "messageId",
+      "externalRequestId",
+      "state"
+    ],
+    "type": "object"
+  },
+  "target_function": "accept_v1",
+  "target_schema": "receipt",
+  "timeout_ms": 2000,
+  "version": 1
+}

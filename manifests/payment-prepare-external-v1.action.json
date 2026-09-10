@@ -1,0 +1,59 @@
+{
+  "action": "prepare_external",
+  "contract_version": "course-1",
+  "enabled": true,
+  "http_method": "POST",
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "is_default": true,
+  "module": "payment",
+  "outcomes": [
+    "PREPARED"
+  ],
+  "request_schema": {
+    "$id": "urn:course:course-1:payment-prepare-external-payload",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId"
+    ],
+    "type": "object"
+  },
+  "required_policy": [
+    "payment:internal"
+  ],
+  "response_schema": {
+    "$id": "urn:course:course-1:payment-prepare-external-result",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "externalRequestId": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "type": "string"
+      },
+      "operationId": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operationId",
+      "externalRequestId"
+    ],
+    "type": "object"
+  },
+  "target_function": "prepare_external_v1",
+  "target_schema": "payment",
+  "timeout_ms": 2000,
+  "version": 1
+}
