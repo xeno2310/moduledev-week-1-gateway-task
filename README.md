@@ -503,3 +503,66 @@ validation перед публикацией; запущенный process за�
 Worker выполняет automatic steps через lease/fencing, вызывает api.invoke и
 атомарно завершает workflow job. Два экземпляра worker-a и worker-b используют
 один C# image и роль workflow_worker с минимальными EXECUTE-привилегиями.
+
+### Workflow diagnostics
+
+Investigation of a stuck or failed process starts with its `processId`.
+Use the public CLI boundary first:
+
+```bash
+docker compose run --rm -T cli flow get <processId>
+```
+
+`flow get` shows the process state and attempt history. For an automatic job, correlate `jobId`, the stable `executionId`, the concrete `attemptId`, and `leaseVersion`.
+
+For direct durable-state investigation:
+
+```sql
+SELECT
+    job_id,
+    process_id,
+    execution_id,
+    state,
+    lease_owner,
+    lease_version,
+    attempt_count,
+    failure_count,
+    next_attempt_at
+FROM workflow.workflow_jobs
+WHERE process_id = '<processId>'::uuid;
+
+SELECT
+    attempt_id,
+    job_id,
+    execution_id,
+    lease_version,
+    attempt_number,
+    status,
+    outcome,
+    error_code,
+    started_at,
+    finished_at
+FROM workflow.task_attempts
+WHERE job_id = '<jobId>'::uuid
+ORDER BY attempt_number, lease_version;
+
+SELECT
+    event_type,
+    metadata,
+    occurred_at
+FROM workflow.workflow_events
+WHERE process_id = '<processId>'::uuid
+ORDER BY occurred_at, event_id;
+```
+
+`TaskClaimed`, `TaskSucceeded`, `TaskRetryScheduled`, and `TaskFailed` carry correlation metadata that links durable history to a concrete attempt.
+
+Worker structured logs can be inspected with:
+
+```bash
+docker compose logs --no-color worker-a worker-b
+```
+
+A job-level diagnostic contains `processId`, `jobId`, `executionId`, `attemptId`, `leaseVersion`, `attemptNumber`, stable `errorCode`, `retryable`, and safe `exceptionType`.
+
+Raw exception messages, process payloads, and action results are not written to diagnostic logs.
