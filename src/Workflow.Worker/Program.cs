@@ -15,6 +15,13 @@ var instanceId =
     ?? throw new InvalidOperationException(
         "WORKER_INSTANCE_ID is not configured.");
 
+var workerScopes =
+    ParseWorkerScopes(
+        Environment.GetEnvironmentVariable(
+            "WORKFLOW_WORKER_SCOPES")
+        ?? throw new InvalidOperationException(
+            "WORKFLOW_WORKER_SCOPES is not configured."));
+
 var testProfile =
     Environment.GetEnvironmentVariable("COURSE_TEST_PROFILE") == "1";
 
@@ -42,6 +49,7 @@ using var sigInt = PosixSignalRegistration.Create(
 await RunWorkerAsync(
     connectionString,
     instanceId,
+    workerScopes,
     leaseMs,
     pollMs,
     shutdown.Token);
@@ -50,6 +58,7 @@ await RunWorkerAsync(
 static async Task RunWorkerAsync(
     string connectionString,
     string instanceId,
+    string[] workerScopes,
     int leaseMs,
     int pollMs,
     CancellationToken cancellationToken)
@@ -87,6 +96,7 @@ static async Task RunWorkerAsync(
                 await ProcessJobAsync(
                     connection,
                     instanceId,
+                    workerScopes,
                     job,
                     cancellationToken);
             }
@@ -98,8 +108,9 @@ static async Task RunWorkerAsync(
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"worker loop error: {ex.GetType().Name}: {ex.Message}");
+            WriteWorkerLoopDiagnostic(
+                instanceId,
+                ex);
 
             try
             {
@@ -219,9 +230,25 @@ static async Task<ClaimedJob?> ClaimAsync(
 static async Task ProcessJobAsync(
     NpgsqlConnection connection,
     string owner,
+    string[] workerScopes,
     ClaimedJob job,
     CancellationToken cancellationToken)
 {
+    if (!HasRequiredPolicy(
+            job.RequiredPolicy,
+            workerScopes))
+    {
+        await FailAsync(
+            connection,
+            job,
+            owner,
+            "access.denied",
+            retryable: false,
+            cancellationToken);
+
+        return;
+    }
+
     JsonNode? payload;
 
     try
@@ -257,16 +284,14 @@ static async Task ProcessJobAsync(
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine(
-            $"mapping error: {ex.Message}");
-
         await FailAsync(
             connection,
             job,
             owner,
             "workflow.mapping_invalid",
             retryable: false,
-            cancellationToken);
+            cancellationToken,
+            exception: ex);
 
         return;
     }
@@ -286,6 +311,7 @@ static async Task ProcessJobAsync(
                 transaction,
                 job,
                 payload,
+                workerScopes,
                 cancellationToken);
         }
         catch (OperationCanceledException)
@@ -465,9 +491,6 @@ static async Task ProcessJobAsync(
             // Connection may already be broken.
         }
 
-        Console.Error.WriteLine(
-            $"job execution error: {ex.GetType().Name}: {ex.Message}");
-
         try
         {
             await FailAsync(
@@ -476,7 +499,8 @@ static async Task ProcessJobAsync(
                 owner,
                 "workflow.worker_error",
                 retryable: true,
-                CancellationToken.None);
+                CancellationToken.None,
+                exception: ex);
         }
         catch
         {
@@ -492,12 +516,16 @@ static async Task<JsonObject> InvokeActionAsync(
     NpgsqlTransaction transaction,
     ClaimedJob job,
     JsonNode? payload,
+    string[] workerScopes,
     CancellationToken cancellationToken)
 {
-    var requiredPolicy =
-        JsonNode.Parse(job.RequiredPolicy)
-        as JsonArray
-        ?? new JsonArray();
+    var scopes =
+        new JsonArray();
+
+    foreach (var scope in workerScopes)
+    {
+        scopes.Add(scope);
+    }
 
     var correlationId =
         Guid.NewGuid();
@@ -512,7 +540,7 @@ static async Task<JsonObject> InvokeActionAsync(
         ["consumer"] = "workflow-worker",
 
         ["scopes"] =
-            requiredPolicy.DeepClone(),
+            scopes,
 
         ["correlationId"] =
             correlationId.ToString(),
@@ -665,8 +693,16 @@ static async Task FailAsync(
     string owner,
     string errorCode,
     bool retryable,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken,
+    Exception? exception = null)
 {
+    WriteJobDiagnostic(
+        owner,
+        job,
+        errorCode,
+        retryable,
+        exception);
+
     await using var command = new NpgsqlCommand(
         """
         SELECT workflow.fail_job(
@@ -701,6 +737,146 @@ static async Task FailAsync(
 
     await command.ExecuteScalarAsync(
         cancellationToken);
+}
+
+
+static string[] ParseWorkerScopes(
+    string value)
+{
+    var scopes =
+        value
+            .Split(
+                ',',
+                StringSplitOptions.RemoveEmptyEntries
+                | StringSplitOptions.TrimEntries)
+            .Distinct(
+                StringComparer.Ordinal)
+            .ToArray();
+
+    if (scopes.Length == 0)
+    {
+        throw new InvalidOperationException(
+            "WORKFLOW_WORKER_SCOPES must contain at least one scope.");
+    }
+
+    return scopes;
+}
+
+
+static bool HasRequiredPolicy(
+    string requiredPolicyJson,
+    string[] workerScopes)
+{
+    try
+    {
+        var requiredPolicy =
+            JsonNode.Parse(requiredPolicyJson)
+            as JsonArray;
+
+        if (requiredPolicy is null)
+        {
+            return false;
+        }
+
+        foreach (var node in requiredPolicy)
+        {
+            if (node is null)
+            {
+                return false;
+            }
+
+            var requiredScope =
+                node.GetValue<string>();
+
+            if (string.IsNullOrWhiteSpace(requiredScope)
+                || !workerScopes.Contains(
+                    requiredScope,
+                    StringComparer.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+    catch
+    {
+        // Malformed policy fails closed.
+        return false;
+    }
+}
+
+
+static void WriteWorkerLoopDiagnostic(
+    string workerId,
+    Exception exception)
+{
+    Console.Error.WriteLine(
+        JsonSerializer.Serialize(
+            new
+            {
+                @event =
+                    "worker.loop_error",
+
+                level =
+                    "error",
+
+                workerId,
+
+                exceptionType =
+                    exception
+                        .GetType()
+                        .Name
+            }));
+}
+
+
+static void WriteJobDiagnostic(
+    string workerId,
+    ClaimedJob job,
+    string errorCode,
+    bool retryable,
+    Exception? exception)
+{
+    Console.Error.WriteLine(
+        JsonSerializer.Serialize(
+            new
+            {
+                @event =
+                    "worker.job_failure",
+
+                level =
+                    "error",
+
+                workerId,
+
+                processId =
+                    job.ProcessId,
+
+                jobId =
+                    job.JobId,
+
+                executionId =
+                    job.ExecutionId,
+
+                attemptId =
+                    job.AttemptId,
+
+                leaseVersion =
+                    job.LeaseVersion,
+
+                attemptNumber =
+                    job.AttemptNumber,
+
+                errorCode,
+
+                retryable,
+
+                exceptionType =
+                    exception?
+                        .GetType()
+                        .Name
+            }));
 }
 
 

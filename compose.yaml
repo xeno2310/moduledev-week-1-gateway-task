@@ -105,6 +105,7 @@ services:
         Username=workflow_worker;
         Password=${COURSE_WORKER_PASSWORD:-workflow-worker-local-only}
       WORKER_INSTANCE_ID: worker-a
+      WORKFLOW_WORKER_SCOPES: "${WORKFLOW_WORKER_SCOPES:-payment:read,payment:write,payment:internal,workflow:execute}"
       COURSE_JWT_ISSUER: "${COURSE_JWT_ISSUER}"
       COURSE_JWT_AUDIENCE: "${COURSE_JWT_AUDIENCE}"
       COURSE_JWT_SIGNING_KEY: "${COURSE_JWT_SIGNING_KEY}"
@@ -124,6 +125,7 @@ services:
         Username=workflow_worker;
         Password=${COURSE_WORKER_PASSWORD:-workflow-worker-local-only}
       WORKER_INSTANCE_ID: worker-b
+      WORKFLOW_WORKER_SCOPES: "${WORKFLOW_WORKER_SCOPES:-payment:read,payment:write,payment:internal,workflow:execute}"
       COURSE_JWT_ISSUER: "${COURSE_JWT_ISSUER}"
       COURSE_JWT_AUDIENCE: "${COURSE_JWT_AUDIENCE}"
       COURSE_JWT_SIGNING_KEY: "${COURSE_JWT_SIGNING_KEY}"

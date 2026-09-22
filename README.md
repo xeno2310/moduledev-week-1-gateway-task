@@ -503,3 +503,59 @@ validation перед публикацией; запущенный process за�
 Worker выполняет automatic steps через lease/fencing, вызывает api.invoke и
 атомарно завершает workflow job. Два экземпляра worker-a и worker-b используют
 один C# image и роль workflow_worker с минимальными EXECUTE-привилегиями.
+
+### Workflow diagnostics
+
+Start an investigation from the stable `processId`. First inspect the
+public process view:
+
+    docker compose run --rm -T cli flow get <processId>
+
+Then correlate the durable job and attempt history in PostgreSQL:
+
+    SELECT
+        j.process_id,
+        j.job_id,
+        j.execution_id,
+        j.state AS job_state,
+        a.attempt_id,
+        a.lease_version,
+        a.attempt_number,
+        a.status AS attempt_status,
+        a.outcome,
+        a.error_code
+    FROM workflow.workflow_jobs AS j
+    LEFT JOIN workflow.task_attempts AS a
+      ON a.job_id = j.job_id
+    WHERE j.process_id = '<processId>'::uuid
+    ORDER BY
+        j.created_at,
+        a.attempt_number;
+
+The durable workflow event sequence can be inspected independently:
+
+    SELECT
+        event_type,
+        metadata,
+        occurred_at
+    FROM workflow.workflow_events
+    WHERE process_id = '<processId>'::uuid
+    ORDER BY
+        occurred_at,
+        event_id;
+
+`TaskSucceeded`, `TaskRetryScheduled` and `TaskFailed` metadata includes
+`processId`, `jobId`, `executionId`, `attemptId` and `leaseVersion`.
+This allows an event to be matched to the exact durable attempt and
+fencing token.
+
+Worker failures are emitted as structured JSON diagnostics. Inspect them
+with:
+
+    docker compose logs --no-color worker-a worker-b
+
+`worker.job_failure` contains `workerId`, `processId`, `jobId`,
+`executionId`, `attemptId`, `leaseVersion`, `attemptNumber`, `errorCode`,
+`retryable` and `exceptionType`. Raw request payloads, credentials and
+raw exception messages are intentionally not part of this diagnostic
+record.
