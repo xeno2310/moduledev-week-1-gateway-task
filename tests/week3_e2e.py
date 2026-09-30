@@ -95,7 +95,7 @@ def make_token(env: dict[str, str], principal: str, scopes: str) -> str:
 
 def synthetic_environment() -> dict[str, str]:
     env = {f"COURSE_{name}_PASSWORD": secrets.token_hex(24)
-           for name in ("POSTGRES", "MIGRATOR", "PUBLISHER", "RUNTIME", "WORKER", "OUTBOX", "INBOX")}
+           for name in ("POSTGRES", "MIGRATOR", "PUBLISHER", "RUNTIME", "WORKER", "OUTBOX", "INBOX", "AUTOCHECK")}
     env.update({
         "COURSE_JWT_ISSUER": "week3-e2e", "COURSE_JWT_AUDIENCE": "week3-e2e-api",
         "COURSE_JWT_SIGNING_KEY": secrets.token_hex(32),
@@ -196,7 +196,8 @@ class Stack:
         print("SETUP | building isolated Compose stack", flush=True)
         self.compose("build", "postgres", "api", "gateway", "cli", "worker-a",
                      "outbox-dispatcher", timeout=1200)
-        self.compose("up", "-d", "--no-build", timeout=240)
+        self.compose("up", "-d", "--no-build", "postgres", "cli", "api", "gateway",
+                     *WORKERS, *PYTHON_SERVICES, "provider-simulator", timeout=240)
         binding = self.compose("port", "gateway", "8080")
         require(binding.startswith("127.0.0.1:"), "Gateway must bind only to localhost")
         self.base_url = "http://" + binding
@@ -209,8 +210,12 @@ class Stack:
     def cleanup(self) -> None:
         if not self.cleanup_armed:
             return
-        # No global prune, volume glob, image removal, or unrelated project name.
-        self.compose("down", "--volumes", "--remove-orphans", "--timeout", "5", timeout=120)
+        self.compose("down", "--volumes", "--remove-orphans", "--rmi", "local",
+                     "--timeout", "5", timeout=120)
+        for image in (self.project + "-worker:local", self.project + "-python:local"):
+            if self.run(["docker", "image", "ls", "-q", "--filter", "reference=" + image],
+                        "Cleanup image lookup"):
+                self.run(["docker", "image", "rm", image], "Cleanup private image")
         label = "label=com.docker.compose.project=" + self.project
         require(not self.run(["docker", "ps", "-aq", "--filter", label], "Cleanup containers"),
                 "Project containers remain after cleanup")
@@ -562,7 +567,7 @@ class Stack:
                    "outcome": callback["result"], "occurredAt": callback["occurredAt"]}
         require(hashlib.sha256(compact(receipt)).hexdigest() == before[0]["body_hash"],
                 "Replay must reconstruct exact signed receipt bytes")
-        callback_url = "http://receipt-adapter:8080/callbacks/provider-v02/" + self.env["PROVIDER_CALLBACK_CAPABILITY"]
+        callback_url = "http://receipt-adapter:8082/callbacks/provider-v02/" + self.env["PROVIDER_CALLBACK_CAPABILITY"]
         code, body = self.internal_http("POST", callback_url, compact(callback), {"Content-Type": "application/json"})
         require(code == 200 and isinstance(body, dict) and body.get("status") == "ok", "Exact callback replay failed")
         require(self.snapshot(operation_id, process_id) == original, "Duplicate changed durable history")

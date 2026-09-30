@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Json.Schema;
@@ -25,34 +24,48 @@ var workerScopes =
 var testProfile =
     Environment.GetEnvironmentVariable("COURSE_TEST_PROFILE") == "1";
 
-var leaseMs = testProfile ? 2000 : 10000;
-var pollMs = testProfile ? 50 : 250;
+// Migration 024 uses a short lease, renewed independently until the task deadline.
+var leaseMs = ReadBoundedIntegerEnvironment(
+    "COURSE_JOB_LEASE_MS", testProfile ? 2000 : 10000, 100, 300000);
+var pollMs = ReadBoundedIntegerEnvironment(
+    "COURSE_WORKER_POLL_MS", testProfile ? 50 : 250, 1, 60000);
 
-using var shutdown = new CancellationTokenSource();
+var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.UseUrls("http://0.0.0.0:8080");
+builder.Services.AddHostedService(_ => new WorkerLoopService(token =>
+    RunWorkerAsync(connectionString, instanceId, workerScopes, leaseMs, pollMs, token)));
+var app = builder.Build();
+app.MapGet("/health/live", () => WorkerObservability.Live().ToResult());
+app.MapGet("/health/ready", async (CancellationToken token) =>
+    (await WorkerObservability.ReadyAsync(
+        ct => WorkerObservability.ProbePostgresAsync(connectionString, ct), token)).ToResult());
+app.MapGet("/metrics", () => WorkerObservability.Metrics().ToResult());
+// ConsoleLifetime owns SIGTERM/SIGINT; the hosted loop receives its stopping
+// token. Bind/start failure propagates and stops the host and worker together.
+await app.RunAsync();
 
-using var sigTerm = PosixSignalRegistration.Create(
-    PosixSignal.SIGTERM,
-    context =>
+
+static int ReadBoundedIntegerEnvironment(
+    string name, int defaultValue, int minimum, int maximum)
+{
+    var raw = Environment.GetEnvironmentVariable(name);
+    if (raw is null)
     {
-        context.Cancel = true;
-        shutdown.Cancel();
-    });
+        return defaultValue;
+    }
 
-using var sigInt = PosixSignalRegistration.Create(
-    PosixSignal.SIGINT,
-    context =>
+    if (raw.Length is < 1 or > 9
+        || raw.Any(character => character < '0' || character > '9')
+        || !int.TryParse(raw, System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out var value)
+        || value < minimum || value > maximum)
     {
-        context.Cancel = true;
-        shutdown.Cancel();
-    });
+        // Do not echo the untrusted value, even for startup errors.
+        throw new InvalidOperationException(name + ": invalid integer configuration.");
+    }
 
-await RunWorkerAsync(
-    connectionString,
-    instanceId,
-    workerScopes,
-    leaseMs,
-    pollMs,
-    shutdown.Token);
+    return value;
+}
 
 
 static async Task RunWorkerAsync(
@@ -74,6 +87,7 @@ static async Task RunWorkerAsync(
 
             while (!cancellationToken.IsCancellationRequested)
             {
+                var claimStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
                 var job = await ClaimAsync(
                     connection,
                     instanceId,
@@ -89,16 +103,12 @@ static async Task RunWorkerAsync(
                     continue;
                 }
 
-                await ReachFailpointAsync(
-                    "after_job_claim",
-                    instanceId);
-
+                await using var heartbeat = new JobLeaseHeartbeat(
+                    leaseMs, job.TimeoutMs, cancellationToken,
+                    token => RenewJobLeaseAsync(connectionString, job, instanceId, leaseMs, token),
+                    claimStartedAt);
                 await ProcessJobAsync(
-                    connection,
-                    instanceId,
-                    workerScopes,
-                    job,
-                    cancellationToken);
+                    connection, instanceId, workerScopes, job, heartbeat, cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -227,285 +237,174 @@ static async Task<ClaimedJob?> ClaimAsync(
 }
 
 
-static async Task ProcessJobAsync(
-    NpgsqlConnection connection,
-    string owner,
-    string[] workerScopes,
-    ClaimedJob job,
-    CancellationToken cancellationToken)
+static async Task<bool> RenewJobLeaseAsync(
+    string connectionString, ClaimedJob job, string owner, int leaseMs, CancellationToken token)
 {
-    if (!HasRequiredPolicy(
-            job.RequiredPolicy,
-            workerScopes))
+    // Each renewal commits independently. Never borrow the action connection.
+    var settings = new NpgsqlConnectionStringBuilder(connectionString)
     {
-        await FailAsync(
-            connection,
-            job,
-            owner,
-            "access.denied",
-            retryable: false,
-            cancellationToken);
+        Pooling = false, Timeout = 1, CommandTimeout = 1, CancellationTimeout = 100
+    };
+    await using var connection = new NpgsqlConnection(settings.ConnectionString);
+    await connection.OpenAsync(token);
+    await using var command = new NpgsqlCommand(
+        "SELECT workflow.renew_job_lease(@job_id, @owner, @lease_version, @lease_ms)", connection);
+    command.Parameters.AddWithValue("job_id", job.JobId);
+    command.Parameters.AddWithValue("owner", owner);
+    command.Parameters.AddWithValue("lease_version", job.LeaseVersion);
+    command.Parameters.AddWithValue("lease_ms", leaseMs);
+    return await command.ExecuteScalarAsync(token) is true;
+}
 
-        return;
-    }
 
-    JsonNode? payload;
-
+static async Task ProcessJobAsync(
+    NpgsqlConnection connection, string owner, string[] workerScopes, ClaimedJob job,
+    JobLeaseHeartbeat heartbeat, CancellationToken shutdown)
+{
+    NpgsqlTransaction? transaction = null;
+    string? failureCode = null;
+    Exception? failure = null;
+    var retryable = false;
+    var committed = false;
+    var completing = false;
+    var completionUncertain = false;
     try
     {
-        payload = BuildPayload(job);
-
-        if (!ValidateSchema(
-                job.RequestSchema,
-                payload))
+        await heartbeat.Started;
+        heartbeat.Token.ThrowIfCancellationRequested();
+        await ReachFailpointAsync("after_job_claim", owner, heartbeat.Token);
+        if (!HasRequiredPolicy(job.RequiredPolicy, workerScopes))
         {
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "workflow.request_invalid",
-                retryable: false,
-                cancellationToken);
-
+            failureCode = "access.denied";
             return;
         }
-    }
-    catch (MappingMissingException)
-    {
-        await FailAsync(
-            connection,
-            job,
-            owner,
-            "workflow.mapping_missing",
-            retryable: false,
-            cancellationToken);
-
-        return;
-    }
-    catch (Exception ex)
-    {
-        await FailAsync(
-            connection,
-            job,
-            owner,
-            "workflow.mapping_invalid",
-            retryable: false,
-            cancellationToken,
-            exception: ex);
-
-        return;
-    }
-
-    await using var transaction =
-        await connection.BeginTransactionAsync(
-            cancellationToken);
-
-    try
-    {
-        JsonObject envelope;
-
+        JsonNode? payload;
         try
         {
-            envelope = await InvokeActionAsync(
-                connection,
-                transaction,
-                job,
-                payload,
-                workerScopes,
-                cancellationToken);
+            payload = BuildPayload(job);
+            if (!ValidateSchema(job.RequestSchema, payload))
+            {
+                failureCode = "workflow.request_invalid";
+                return;
+            }
         }
-        catch (OperationCanceledException)
-            when (!cancellationToken.IsCancellationRequested)
+        catch (MappingMissingException)
         {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "action.timeout",
-                retryable: true,
-                CancellationToken.None);
-
+            failureCode = "workflow.mapping_missing";
             return;
         }
-
-        var status =
-            envelope["status"]?.GetValue<string>();
-
+        catch (Exception error)
+        {
+            failureCode = "workflow.mapping_invalid";
+            failure = error;
+            return;
+        }
+        heartbeat.Token.ThrowIfCancellationRequested();
+        transaction = await connection.BeginTransactionAsync(heartbeat.Token);
+        var envelope = await InvokeActionAsync(
+            connection, transaction, job, payload, workerScopes, heartbeat.Deadline, heartbeat.Token);
+        var status = envelope["status"]?.GetValue<string>();
         if (status == "error")
         {
-            var code =
-                envelope["code"]?.GetValue<string>()
-                ?? "workflow.action_error";
-
-            var retryable =
-                envelope["retryable"]?.GetValue<bool>()
-                ?? false;
-
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                code,
-                retryable,
-                CancellationToken.None);
-
+            failureCode = envelope["code"]?.GetValue<string>() ?? "workflow.action_error";
+            retryable = envelope["retryable"]?.GetValue<bool>() ?? false;
             return;
         }
-
         if (status != "ok")
         {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "workflow.action_contract_invalid",
-                retryable: false,
-                CancellationToken.None);
-
+            failureCode = "workflow.action_contract_invalid";
             return;
         }
-
-        var outcome =
-            envelope["outcome"]?.GetValue<string>();
-
-        if (string.IsNullOrWhiteSpace(outcome)
-            || !IsDeclaredOutcome(
-                job.Outcomes,
-                outcome))
+        var outcome = envelope["outcome"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(outcome) || !IsDeclaredOutcome(job.Outcomes, outcome))
         {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "workflow.outcome_unknown",
-                retryable: false,
-                CancellationToken.None);
-
+            failureCode = "workflow.outcome_unknown";
             return;
         }
-
-        var result =
-            envelope["result"]?.DeepClone();
-
-        if (!ValidateSchema(
-                job.ResponseSchema,
-                result))
+        var result = envelope["result"]?.DeepClone();
+        if (!ValidateSchema(job.ResponseSchema, result))
         {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "workflow.response_invalid",
-                retryable: false,
-                CancellationToken.None);
-
+            failureCode = "workflow.response_invalid";
             return;
         }
-
-        // Вторая обязательная crash-window:
-        // action уже выполнен внутри transaction,
-        // finish ещё не вызван и COMMIT ещё не было.
-        await ReachFailpointAsync(
-            "after_action_before_finish",
-            owner);
-
-        var finishEnvelope =
-            await FinishAsync(
-                connection,
-                transaction,
-                job,
-                owner,
-                outcome,
-                result,
-                cancellationToken);
-
-        var finishStatus =
-            finishEnvelope["status"]?.GetValue<string>();
-
-        if (finishStatus != "ok")
+        // The action effect is still uncommitted; the independent heartbeat
+        // continues through this wait, and cancellation cannot continue to finish.
+        await ReachFailpointAsync("after_action_before_finish", owner, heartbeat.Token);
+        await heartbeat.StopAsync();
+        if (heartbeat.Reason != JobLeaseStop.NormalStop)
+            return;
+        var budget = heartbeat.CompletionBudgetMs;
+        if (budget == 0)
         {
-            var code =
-                finishEnvelope["code"]?.GetValue<string>()
-                ?? "workflow.finish_failed";
-
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-
-            // При fencing ничего дополнительно менять нельзя.
-            if (code != "workflow.lease_stale")
-            {
-                await FailAsync(
-                    connection,
-                    job,
-                    owner,
-                    code,
-                    retryable: false,
-                    CancellationToken.None);
-            }
-
+            completionUncertain = true;
             return;
         }
-
-        await transaction.CommitAsync(
-            cancellationToken);
+        using var completion = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        completion.CancelAfter(budget);
+        completing = true;
+        var finished = await FinishAsync(
+            connection, transaction, job, owner, outcome, result, completion.Token);
+        if (finished["status"]?.GetValue<string>() != "ok")
+        {
+            failureCode = finished["code"]?.GetValue<string>() ?? "workflow.finish_failed";
+            completionUncertain = failureCode == "workflow.lease_stale";
+            return;
+        }
+        await transaction.CommitAsync(completion.Token);
+        committed = true;
     }
     catch (OperationCanceledException)
-        when (cancellationToken.IsCancellationRequested)
     {
-        try
-        {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
-        }
-        catch
-        {
-            // Container is shutting down.
-        }
-
-        throw;
+        // The heartbeat owns classification: shutdown, timeout, and lease loss
+        // must not all consume the action's retry budget.
+        completionUncertain = completing;
     }
-    catch (Exception ex)
+    catch (Exception error)
     {
-        try
+        failure = error;
+        failureCode = "workflow.worker_error";
+        retryable = true;
+        completionUncertain = completing;
+    }
+    finally
+    {
+        // Join renewal before either finish/fail can acquire the job row lock.
+        await heartbeat.StopAsync();
+        if (transaction is not null)
         {
-            await transaction.RollbackAsync(
-                CancellationToken.None);
+            if (!committed)
+            {
+                try { await transaction.RollbackAsync(CancellationToken.None); }
+                catch { /* A broken connection also rolls back on the server. */ }
+            }
+            await transaction.DisposeAsync();
         }
-        catch
+        if (!committed && heartbeat.Reason != JobLeaseStop.Shutdown)
         {
-            // Connection may already be broken.
-        }
-
-        try
-        {
-            await FailAsync(
-                connection,
-                job,
-                owner,
-                "workflow.worker_error",
-                retryable: true,
-                CancellationToken.None,
-                exception: ex);
-        }
-        catch
-        {
-            // If the connection itself failed, lease expiry will
-            // make the job recoverable by another worker.
+            var budget = heartbeat.CompletionBudgetMs;
+            if (heartbeat.Reason == JobLeaseStop.LeaseLost || completionUncertain || budget == 0)
+            {
+                // No fail_job: a stale/uncertain lease is recovered by expiry,
+                // without charging failure_count or changing another owner's work.
+                WriteJobDiagnostic(owner, job, heartbeat.Reason == JobLeaseStop.LeaseLost
+                    ? heartbeat.DiagnosticCode : "workflow.lease_stale", false, null);
+            }
+            else
+            {
+                if (heartbeat.Reason == JobLeaseStop.Timeout)
+                {
+                    failureCode = "action.timeout";
+                    retryable = true;
+                    failure = null;
+                }
+                if (failureCode is not null)
+                {
+                    using var completion = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+                    completion.CancelAfter(budget);
+                    await FailAsync(connection, job, owner, failureCode, retryable,
+                        completion.Token, exception: failure);
+                }
+            }
         }
     }
 }
@@ -517,6 +416,7 @@ static async Task<JsonObject> InvokeActionAsync(
     ClaimedJob job,
     JsonNode? payload,
     string[] workerScopes,
+    DateTimeOffset deadline,
     CancellationToken cancellationToken)
 {
     var scopes =
@@ -529,10 +429,6 @@ static async Task<JsonObject> InvokeActionAsync(
 
     var correlationId =
         Guid.NewGuid();
-
-    var deadline =
-        DateTimeOffset.UtcNow
-            .AddMilliseconds(job.TimeoutMs);
 
     var context = new JsonObject
     {
@@ -601,17 +497,7 @@ static async Task<JsonObject> InvokeActionAsync(
             payload?.ToJsonString()
             ?? "null";
 
-    using var timeout =
-        CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken);
-
-    timeout.CancelAfter(
-        TimeSpan.FromMilliseconds(
-            job.TimeoutMs));
-
-    var raw =
-        await command.ExecuteScalarAsync(
-            timeout.Token);
+    var raw = await command.ExecuteScalarAsync(cancellationToken);
 
     if (raw is not string json)
     {
@@ -1324,7 +1210,8 @@ static bool TryCanonicalArrayIndex(
 
 static async Task ReachFailpointAsync(
     string name,
-    string instanceId)
+    string instanceId,
+    CancellationToken cancellationToken)
 {
     var enabled =
         Environment.GetEnvironmentVariable(
@@ -1351,12 +1238,194 @@ static async Task ReachFailpointAsync(
                 name,
                 instanceId
             }));
+    await Console.Out.FlushAsync(cancellationToken);
 
     // Checker deliberately kills this container.
     await Task.Delay(
-        Timeout.InfiniteTimeSpan);
+        Timeout.InfiniteTimeSpan,
+        cancellationToken);
 }
 
+
+public enum JobLeaseStop { Running, NormalStop, Timeout, LeaseLost, Shutdown }
+
+public static class JobLeasePolicy
+{
+    public static int IntervalMs(int leaseMs)
+    {
+        if (leaseMs is < 100 or > 300000)
+            throw new ArgumentOutOfRangeException(nameof(leaseMs));
+        return Math.Clamp(leaseMs / 4, 25, 1000);
+    }
+
+    public static int RemainingTaskMs(int timeoutMs, double elapsedMs)
+    {
+        if (timeoutMs is < 1 or > 30000)
+            throw new ArgumentOutOfRangeException(nameof(timeoutMs));
+        return (int)Math.Max(0, Math.Floor(timeoutMs - Math.Max(0, elapsedMs)));
+    }
+
+    public static int CompletionBudgetMs(int leaseMs, double sinceRenewalMs) =>
+        (int)Math.Max(0, Math.Min(1000,
+            Math.Floor(leaseMs - Math.Max(0, sinceRenewalMs) - IntervalMs(leaseMs))));
+
+    public static JobLeaseStop Classify(bool shutdown, bool lost, bool timeout, bool stopped) =>
+        shutdown ? JobLeaseStop.Shutdown : lost ? JobLeaseStop.LeaseLost :
+        timeout ? JobLeaseStop.Timeout : stopped ? JobLeaseStop.NormalStop : JobLeaseStop.Running;
+}
+
+public sealed class JobLeaseHeartbeat : IAsyncDisposable
+{
+    private readonly int leaseMs;
+    private readonly int timeoutMs;
+    private readonly long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+    private long lastRenewalStarted;
+    private readonly CancellationToken shutdown;
+    private readonly CancellationTokenSource deadline = new();
+    private readonly CancellationTokenSource lost = new();
+    private readonly CancellationTokenSource stop = new();
+    private readonly CancellationTokenSource work;
+    private readonly CancellationTokenSource delay;
+    private readonly TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Task loop;
+    private int stoppedReason;
+
+    public JobLeaseHeartbeat(int leaseMs, int timeoutMs, CancellationToken shutdown,
+        Func<CancellationToken, Task<bool>> renew, long claimStartedAt)
+    {
+        JobLeasePolicy.IntervalMs(leaseMs);
+        JobLeasePolicy.RemainingTaskMs(timeoutMs, 0);
+        this.leaseMs = leaseMs;
+        this.timeoutMs = timeoutMs;
+        this.shutdown = shutdown;
+        lastRenewalStarted = claimStartedAt;
+        Deadline = DateTimeOffset.UtcNow.AddMilliseconds(
+            JobLeasePolicy.RemainingTaskMs(timeoutMs, ElapsedMs));
+        work = CancellationTokenSource.CreateLinkedTokenSource(shutdown, deadline.Token, lost.Token);
+        delay = CancellationTokenSource.CreateLinkedTokenSource(work.Token, stop.Token);
+        deadline.CancelAfter(JobLeasePolicy.RemainingTaskMs(timeoutMs, ElapsedMs));
+        loop = RunAsync(renew); // Owned and joined by StopAsync/DisposeAsync.
+    }
+
+    public DateTimeOffset Deadline { get; }
+    public CancellationToken Token => work.Token;
+    public Task Started => started.Task;
+    public string DiagnosticCode { get; private set; } = "workflow.lease_lost";
+    private double ElapsedMs => System.Diagnostics.Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
+    public int CompletionBudgetMs => JobLeasePolicy.CompletionBudgetMs(leaseMs,
+        System.Diagnostics.Stopwatch.GetElapsedTime(Volatile.Read(ref lastRenewalStarted)).TotalMilliseconds);
+    public JobLeaseStop Reason => shutdown.IsCancellationRequested ? JobLeaseStop.Shutdown :
+        Volatile.Read(ref stoppedReason) is var reason && reason != 0 ? (JobLeaseStop)reason :
+        JobLeasePolicy.Classify(false, lost.IsCancellationRequested,
+            deadline.IsCancellationRequested || ElapsedMs >= timeoutMs, stop.IsCancellationRequested);
+
+    private async Task RunAsync(Func<CancellationToken, Task<bool>> renew)
+    {
+        try
+        {
+            while (!delay.IsCancellationRequested)
+            {
+                var remaining = JobLeasePolicy.RemainingTaskMs(timeoutMs, ElapsedMs);
+                if (remaining == 0)
+                {
+                    deadline.Cancel();
+                    return;
+                }
+                var renewalStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                try
+                {
+                    using var request = CancellationTokenSource.CreateLinkedTokenSource(work.Token);
+                    request.CancelAfter(Math.Min(JobLeasePolicy.IntervalMs(leaseMs), remaining));
+                    if (!await renew(request.Token))
+                    {
+                        lost.Cancel();
+                        return;
+                    }
+                    Volatile.Write(ref lastRenewalStarted, renewalStarted);
+                    started.TrySetResult();
+                }
+                catch (Exception)
+                {
+                    if (!work.IsCancellationRequested)
+                    {
+                        DiagnosticCode = "workflow.lease_renewal_failed";
+                        lost.Cancel();
+                    }
+                    return;
+                }
+                try { await Task.Delay(JobLeasePolicy.IntervalMs(leaseMs), delay.Token); }
+                catch (OperationCanceledException) when (delay.IsCancellationRequested) { return; }
+            }
+        }
+        finally { started.TrySetResult(); }
+    }
+
+    public async Task StopAsync()
+    {
+        // Cancel the interval, but join any bounded renewal already in flight.
+        // Normal stop must neither cancel the action nor imitate lease loss.
+        stop.Cancel();
+        await loop;
+        Interlocked.CompareExchange(ref stoppedReason, (int)Reason, 0);
+        deadline.CancelAfter(Timeout.Infinite);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync();
+        delay.Dispose();
+        work.Dispose();
+        stop.Dispose();
+        lost.Dispose();
+        deadline.Dispose();
+    }
+}
+
+sealed class WorkerLoopService(Func<CancellationToken, Task> run) : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => run(stoppingToken);
+}
+
+public sealed record WorkerProbeResponse(int StatusCode, string Body, string ContentType)
+{
+    public IResult ToResult() => Results.Text(Body, ContentType, statusCode: StatusCode);
+}
+
+public static class WorkerObservability
+{
+    public const string MetricsContentType = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+    public static WorkerProbeResponse Live() => new(200, "{\"status\":\"live\"}", "application/json");
+    public static WorkerProbeResponse Metrics() => new(200, "# TYPE process_up gauge\nprocess_up 1\n# EOF\n", MetricsContentType);
+
+    public static async Task<WorkerProbeResponse> ReadyAsync(
+        Func<CancellationToken, Task> probe, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            await probe(timeout.Token).WaitAsync(timeout.Token);
+            return new(200, "{\"status\":\"ready\"}", "application/json");
+        }
+        catch (Exception)
+        {
+            return new(503, "{\"status\":\"not_ready\",\"code\":\"dependency.unavailable\"}", "application/json");
+        }
+    }
+
+    public static async Task ProbePostgresAsync(string connectionString, CancellationToken token)
+    {
+        // A separate unpooled probe never changes action connections/timeouts.
+        var settings = new NpgsqlConnectionStringBuilder(connectionString)
+        {
+            Pooling = false, Timeout = 2, CommandTimeout = 2, CancellationTimeout = 500
+        };
+        await using var connection = new NpgsqlConnection(settings.ConnectionString);
+        await connection.OpenAsync(token);
+        await using var command = new NpgsqlCommand("SELECT 1", connection);
+        await command.ExecuteScalarAsync(token);
+    }
+}
 
 sealed record ClaimedJob(
     Guid JobId,

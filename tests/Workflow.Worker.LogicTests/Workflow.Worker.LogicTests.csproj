@@ -8,6 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../../src/Api/Api.csproj" />
     <ProjectReference
       Include="../../src/Workflow.Worker/Workflow.Worker.csproj" />
   </ItemGroup>

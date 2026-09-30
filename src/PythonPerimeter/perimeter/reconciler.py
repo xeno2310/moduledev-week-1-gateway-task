@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import os
 import time
 
 import psycopg
 
+from .common import inbox_poll_ms, observability_server, postgres_ready
 
 def _interval() -> float:
-    return (
-        0.10
-        if os.getenv(
-            "COURSE_TEST_PROFILE",
-            "0",
-        ) == "1"
-        else 0.40
-    )
+    return inbox_poll_ms() / 1000.0
 
 
 def _run_connection() -> None:
@@ -47,16 +40,17 @@ def _run_connection() -> None:
 def main() -> None:
     interval = _interval()
 
-    while True:
-        try:
-            _run_connection()
-        except (
-            psycopg.Error,
-            OSError,
-        ):
-            time.sleep(
-                interval
-            )
+    with observability_server(postgres_ready):
+        while True:
+            try:
+                _run_connection()
+            except (
+                psycopg.Error,
+                OSError,
+            ):
+                time.sleep(
+                    interval
+                )
 
 
 if __name__ == "__main__":

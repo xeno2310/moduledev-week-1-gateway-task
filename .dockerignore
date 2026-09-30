@@ -1,0 +1,13 @@
+.git
+.codex
+.agents
+.docker
+.idea
+.vs
+**/bin
+**/obj
+**/__pycache__
+**/.env
+**/.env.*
+**/*.log
+week-*-public-report.json

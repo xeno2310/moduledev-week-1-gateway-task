@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
+import secrets
 import subprocess
+import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -44,15 +48,87 @@ SIGNAL_PAYLOAD = "/audit/" + str(
 SIGNAL_TYPE = str(FIXTURE["signalType"])
 RETRY_ERROR = str(FIXTURE["errorCodes"]["retry"])
 
+STACK_PREFIX: list[str] | None = None
+STACK_ENV: dict[str, str] | None = None
+STACK_TEMP: tempfile.TemporaryDirectory[str] | None = None
+STACK_WORKER_IMAGE = ""
+
+
+def prepare_stack() -> None:
+    global STACK_PREFIX, STACK_ENV, STACK_TEMP, STACK_WORKER_IMAGE
+    STACK_TEMP = tempfile.TemporaryDirectory(prefix="week2-regression-")
+    project = "week2-regression-" + uuid.uuid4().hex
+    STACK_WORKER_IMAGE = project + "-worker:local"
+    directory = Path(STACK_TEMP.name)
+    env_file = directory / "empty.env"
+    env_file.write_text("", encoding="utf-8")
+    override = directory / "images.json"
+    override.write_text(json.dumps({"services": {
+        name: {"image": STACK_WORKER_IMAGE}
+        for name in ("worker-a", "worker-b")
+    }}), encoding="utf-8")
+    STACK_PREFIX = [
+        "docker", "compose", "--project-name", project,
+        "--project-directory", str(ROOT), "--env-file", str(env_file),
+        "-f", str(ROOT / "compose.yaml"), "-f", str(override),
+    ]
+    STACK_ENV = {
+        key: value for key, value in os.environ.items()
+        if not key.upper().startswith((
+            "COMPOSE_", "COURSE_", "PROVIDER_", "OUTBOX_", "RECEIPT_", "WORKFLOW_",
+        ))
+    }
+    STACK_ENV.update({
+        f"COURSE_{name}_PASSWORD": secrets.token_hex(24)
+        for name in (
+            "POSTGRES", "MIGRATOR", "PUBLISHER", "RUNTIME", "WORKER",
+            "OUTBOX", "INBOX", "AUTOCHECK",
+        )
+    })
+    STACK_ENV.update({
+        "COURSE_JWT_ISSUER": "week2-regression",
+        "COURSE_JWT_AUDIENCE": "week2-regression",
+        "COURSE_JWT_SIGNING_KEY": secrets.token_hex(32),
+        "PROVIDER_HMAC_SECRET": secrets.token_hex(32),
+        "PROVIDER_CALLBACK_CAPABILITY": secrets.token_hex(24),
+        "PROVIDER_CALLBACK_TOKEN": secrets.token_hex(32),
+        "PROVIDER_AUDIT_TOKEN": secrets.token_hex(24),
+        "COURSE_TEST_PROFILE": "1",
+        "COURSE_GATEWAY_PORT": "0",
+        "COMPOSE_DISABLE_ENV_FILE": "1",
+    })
+
+
+def cleanup_stack() -> None:
+    global STACK_PREFIX, STACK_ENV, STACK_TEMP, STACK_WORKER_IMAGE
+    if STACK_PREFIX is None:
+        return
+    try:
+        result = compose("down", "--volumes", "--remove-orphans", "--rmi", "local")
+        if result.returncode != 0:
+            raise RuntimeError("Week 2 isolated Docker cleanup failed (output withheld)")
+    finally:
+        if STACK_WORKER_IMAGE:
+            run(["docker", "image", "rm", STACK_WORKER_IMAGE], timeout=60)
+        if STACK_TEMP is not None:
+            STACK_TEMP.cleanup()
+        STACK_PREFIX = None
+        STACK_ENV = None
+        STACK_TEMP = None
+        STACK_WORKER_IMAGE = ""
+
 
 def run(
     command: list[str],
     timeout: int = 120,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if STACK_PREFIX is not None and command[:2] == ["docker", "compose"]:
+        command = [*STACK_PREFIX, *command[2:]]
     return subprocess.run(
         command,
         cwd=ROOT,
+        env=STACK_ENV,
         input=input_text,
         text=True,
         encoding="utf-8",
@@ -191,6 +267,8 @@ def start_test_worker(
         "-e",
         "COURSE_TEST_PROFILE=1",
         "-e",
+        "COURSE_JOB_LEASE_MS=2000",
+        "-e",
         f"COURSE_FAILPOINT={failpoint}",
         "-e",
         f"WORKFLOW_WORKER_SCOPES={scopes}",
@@ -254,14 +332,59 @@ class WorkflowRegressionTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        result = compose("up", "-d", "--no-build", "postgres")
+        prepare_stack()
+        try:
+            for stage, arguments in (
+                ("build", ("build", "postgres", "cli", "api", "worker-a")),
+                ("startup", ("up", "-d", "--no-build", "api")),
+            ):
+                result = compose(*arguments)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"Week 2 isolated {stage} failed (output withheld)"
+                    )
+            for arguments in (
+                ("migration", "apply", "/audit/migrations"),
+                ("action", "publish", "/audit/" + FIXTURE["files"]["actionManifest"]),
+                ("action", "publish", "/audit/" + FIXTURE["files"]["disabledActionManifest"]),
+                ("action", "activate", FIXTURE["module"] + "." + FIXTURE["action"],
+                 "--version", "1"),
+                ("flow", "publish", "/audit/" + FIXTURE["files"]["flowV1Json"]),
+                ("flow", "activate", FLOW, "--version", "1"),
+            ):
+                code, envelope, _ = cli(*arguments)
+                if code != 0 or not isinstance(envelope, dict) or envelope.get("status") != "ok":
+                    raise RuntimeError("Week 2 fixture setup failed (output withheld)")
+        except BaseException:
+            cleanup_stack()
+            raise
 
-        if result.returncode != 0:
-            raise RuntimeError(
-                "PostgreSQL is not available:\n"
-                + result.stdout
-                + result.stderr
-            )
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cleanup_stack()
+
+    def finish_signal_process(self, process_id: str) -> None:
+        rc, envelope, _ = cli("flow", "signal", process_id, "--type", SIGNAL_TYPE,
+                              "--message-id", uuid.uuid4().hex, "--payload", SIGNAL_PAYLOAD)
+        self.assertEqual(rc, 0, "Completion signal failed (output withheld)")
+        self.assertIsNotNone(envelope)
+        self.assertEqual(envelope['status'], 'ok')
+        self.assertEqual(db("SELECT state FROM workflow.process_instances WHERE process_id="
+                            + sql_quote(process_id) + "::uuid;"), "COMPLETED")
+
+    def publish_crash_flow(self) -> str:
+        document = json.loads((FIXTURES / FIXTURE['files']['flowV1Json']).read_text(encoding='utf-8'))
+        document['flow_name'] = 'lease-crash-' + uuid.uuid4().hex
+        for step in document['steps']:
+            if step['type'] == 'automatic':
+                step['task']['timeout_ms'] = 30000
+        rc, envelope, _ = cli('flow', 'publish', '/dev/stdin', input_text=json.dumps(document))
+        self.assertEqual(rc, 0, 'Crash fixture publication failed (output withheld)')
+        self.assertEqual(envelope['status'], 'ok')
+        rc, envelope, _ = cli('flow', 'activate', document['flow_name'], '--version', '1')
+        self.assertEqual(rc, 0, 'Crash fixture activation failed (output withheld)')
+        self.assertEqual(envelope['status'], 'ok')
+        return document['flow_name']
 
     def test_concurrent_start_is_idempotent(self) -> None:
         business_key = "regression-concurrent-" + uuid.uuid4().hex
@@ -467,7 +590,9 @@ class WorkflowRegressionTests(unittest.TestCase):
                 (remaining_ms + 300) / 1000.0
             )
 
-            second = claim(owner_b)
+            # This fencing test performs many host-side SQL observations;
+            # short-lease timing is asserted separately by the crash/long tests.
+            second = claim(owner_b, lease_ms=10000)
 
             self.assertIn(
                 job_id,
@@ -479,6 +604,17 @@ class WorkflowRegressionTests(unittest.TestCase):
                 second[job_id],
                 old_lease,
             )
+
+            snapshot_sql = ("SELECT to_jsonb(j)::text FROM workflow.workflow_jobs j WHERE job_id="
+                            + sql_quote(job_id) + "::uuid;")
+            stable = db(snapshot_sql)
+            for stale_owner, stale_version in ((owner_a, old_lease), (owner_b, old_lease),
+                                                (owner_a, second[job_id])):
+                renewed = db("SET ROLE workflow_worker; SELECT workflow.renew_job_lease("
+                             + sql_quote(job_id) + "::uuid," + sql_quote(stale_owner) + ","
+                             + str(stale_version) + ",2000)::text;")
+                self.assertEqual(renewed, 'false')
+                self.assertEqual(db(snapshot_sql), stable)
 
             response = db(
                 "SET ROLE workflow_worker; "
@@ -504,6 +640,8 @@ class WorkflowRegressionTests(unittest.TestCase):
                 envelope["code"],
                 "workflow.lease_stale",
             )
+
+            self.assertEqual(db(snapshot_sql), stable)
 
             attempts = db(
                 "SELECT string_agg("
@@ -944,6 +1082,7 @@ COMMIT;
 
             deadline = time.monotonic() + 15.0
             process_row = ""
+            saw_heartbeat = False
 
             while time.monotonic() < deadline:
                 process_row = db(
@@ -955,6 +1094,13 @@ COMMIT;
                     + sql_quote(process_id)
                     + "::uuid;"
                 )
+
+                saw_heartbeat = saw_heartbeat or db(
+                    "SELECT EXISTS (SELECT 1 FROM workflow.workflow_jobs j "
+                    "JOIN workflow.task_attempts a USING(job_id) WHERE j.process_id="
+                    + sql_quote(process_id) + "::uuid AND j.state='LEASED' AND j.attempt_count=1 "
+                    "AND j.lease_until-j.updated_at=interval '2000 milliseconds' "
+                    "AND j.updated_at >= a.started_at + interval '500 milliseconds')::text;") == 'true'
 
                 if process_row == (
                     "WAITING_SIGNAL|"
@@ -1078,6 +1224,9 @@ COMMIT;
                 1,
             )
 
+            self.assertTrue(saw_heartbeat, "Long action did not expose independent heartbeat evidence")
+            self.finish_signal_process(process_id)
+
         finally:
             remove_container(worker_a)
             remove_container(worker_b)
@@ -1118,9 +1267,13 @@ COMMIT;
             )
 
 
-    def test_zzz_crash_after_action_rolls_back_and_recovers(
-        self,
-    ) -> None:
+    def test_zzz_crash_after_action_rolls_back_and_recovers(self) -> None:
+        self.assert_crash_recovery("after_action_before_finish")
+
+    def test_zzz_crash_after_claim_uses_short_lease(self) -> None:
+        self.assert_crash_recovery("after_job_claim")
+
+    def assert_crash_recovery(self, failpoint: str) -> None:
         normal = compose(
             "up",
             "-d",
@@ -1170,13 +1323,14 @@ COMMIT;
         )
 
         try:
+            flow = self.publish_crash_flow()
             start_test_worker(
                 crash_worker,
                 crash_instance,
                 "payment:read,"
                 "payment:write,"
                 "workflow:execute",
-                failpoint="after_action_before_finish",
+                failpoint=failpoint,
             )
 
             business_key = (
@@ -1187,7 +1341,7 @@ COMMIT;
             rc, body, raw = cli(
                 "flow",
                 "start",
-                FLOW,
+                flow,
                 "--business-key",
                 business_key,
                 "--data",
@@ -1205,8 +1359,7 @@ COMMIT;
             process_id = body["result"]["processId"]
 
             # ------------------------------------------------
-            # Wait until action executed but finish_job has
-            # deliberately not been called yet.
+            # Exact acknowledgement, while the replacement worker is stopped.
             # ------------------------------------------------
 
             deadline = time.monotonic() + 12.0
@@ -1241,7 +1394,7 @@ COMMIT;
                     item.get("event")
                     == "failpoint.reached"
                     and item.get("name")
-                    == "after_action_before_finish"
+                    == failpoint
                     and item.get("instanceId")
                     == crash_instance
                     for item in entries
@@ -1254,13 +1407,13 @@ COMMIT;
 
             self.assertTrue(
                 acknowledged,
-                "after_action_before_finish was not reached",
+                failpoint + " was not reached",
             )
 
             # ------------------------------------------------
             # Claim transaction was committed earlier, so job
-            # and attempt are visible. Action transaction is
-            # still open and its effect must not be visible.
+            # and attempt are visible. No committed action effect is visible
+            # at either crash boundary.
             # ------------------------------------------------
 
             job_row = db(
@@ -1354,12 +1507,37 @@ COMMIT;
                 0,
             )
 
+            # Observe actual renewals for >2s while the acknowledged failpoint
+            # remains held. This is a database barrier, not a timing sleep.
+            deadline = time.monotonic() + 8
+            renewed = False
+            while time.monotonic() < deadline:
+                lease_fact = json.loads(db(
+                    "SELECT jsonb_build_object('duration',extract(epoch FROM (j.lease_until-j.updated_at))*1000,"
+                    "'renewed',j.updated_at >= a.started_at + interval '2100 milliseconds',"
+                    "'count',j.attempt_count,'version',j.lease_version,'failure',j.failure_count)::text "
+                    "FROM workflow.workflow_jobs j JOIN workflow.task_attempts a USING(job_id) WHERE j.job_id="
+                    + sql_quote(job_id) + "::uuid AND a.attempt_number=1;"))
+                self.assertEqual(lease_fact['duration'], 2000)
+                self.assertEqual(lease_fact['count'], 1)
+                self.assertEqual(lease_fact['version'], first_lease_version)
+                self.assertEqual(lease_fact['failure'], 0)
+                if lease_fact['renewed']:
+                    renewed = True
+                    break
+            self.assertTrue(renewed, 'Live failpoint did not retain a short lease with heartbeat')
+
             # ------------------------------------------------
             # Real process crash: connection disappears and
             # uncommitted action transaction must rollback.
             # ------------------------------------------------
 
-            remove_container(crash_worker)
+            killed_at = time.monotonic()
+            killed_db_at = db("SELECT clock_timestamp()::text;")
+            killed = run(["docker", "rm", "-f", crash_worker], timeout=10)
+            self.assertEqual(killed.returncode, 0, "Crash worker kill failed (output withheld)")
+            last_lease = db("SELECT lease_until::text FROM workflow.workflow_jobs WHERE job_id="
+                            + sql_quote(job_id) + "::uuid;")
 
             effect_after_crash = int(
                 db(
@@ -1388,7 +1566,7 @@ COMMIT;
                 "workflow:execute",
             )
 
-            deadline = time.monotonic() + 15.0
+            deadline = killed_at + 12.0
             process_row = ""
 
             while time.monotonic() < deadline:
@@ -1414,6 +1592,22 @@ COMMIT;
                 process_row,
                 "WAITING_SIGNAL|" + WAIT_STEP,
             )
+
+            self.assertLess(time.monotonic() - killed_at, 12.0,
+                            'Recovery must be bounded well below the 30s task timeout')
+            # started_at is transaction-time now(), slightly before the claim
+            # predicate uses clock_timestamp(); allow only 50ms for that query.
+            timing = json.loads(db(
+                "SELECT jsonb_build_object('afterLease',started_at >= " + sql_quote(last_lease)
+                + "::timestamptz - interval '50 milliseconds','afterKillMs',extract(epoch FROM (started_at-"
+                + sql_quote(killed_db_at) + "::timestamptz))*1000)::text "
+                "FROM workflow.task_attempts WHERE job_id=" + sql_quote(job_id)
+                + "::uuid AND attempt_number=2;"))
+            self.assertTrue(timing['afterLease'], 'Reclaimed before the last committed lease expired')
+            self.assertGreaterEqual(timing['afterKillMs'], 0)
+            self.assertLess(timing['afterKillMs'], 12000)
+            print(f"EVIDENCE | {failpoint} leaseMs=2000 taskTimeoutMs=30000 "
+                  f"reclaimAfterKillMs={timing['afterKillMs']:.1f}", flush=True)
 
             # ------------------------------------------------
             # Stable jobId/executionId, newer leaseVersion,
@@ -1580,6 +1774,10 @@ COMMIT;
                     second[2],
                 ],
             )
+
+            self.assertEqual(db("SELECT failure_count::text FROM workflow.workflow_jobs WHERE job_id="
+                                + sql_quote(job_id) + "::uuid;"), "0")
+            self.finish_signal_process(process_id)
 
         finally:
             remove_container(crash_worker)
@@ -2242,4 +2440,9 @@ COMMIT;
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:] == ["--list"]:
+        names = unittest.defaultTestLoader.getTestCaseNames(WorkflowRegressionTests)
+        print("\n".join(names))
+        print(f"total={len(names)} (list only; Docker not invoked)")
+    else:
+        unittest.main(verbosity=2)

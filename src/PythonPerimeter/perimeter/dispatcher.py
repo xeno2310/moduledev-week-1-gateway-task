@@ -11,30 +11,20 @@ import psycopg
 
 from .common import (
     compact_json_bytes,
+    dispatcher_settings,
     parse_provider_success,
+    observability_server,
+    postgres_ready,
+    reach_failpoint,
 )
 
 
 def _sleep_interval() -> float:
-    return (
-        0.10
-        if os.getenv(
-            "COURSE_TEST_PROFILE",
-            "0",
-        ) == "1"
-        else 0.40
-    )
+    return dispatcher_settings().poll_ms / 1000.0
 
 
 def _http_timeout() -> float:
-    return (
-        2.0
-        if os.getenv(
-            "COURSE_TEST_PROFILE",
-            "0",
-        ) == "1"
-        else 10.0
-    )
+    return dispatcher_settings().timeout_ms / 1000.0
 
 
 def _provider_endpoint() -> tuple[
@@ -171,6 +161,9 @@ def _process_claim(
         provider_request
     )
 
+    reach_failpoint("after_outbox_claim", owner, outboxId=str(outbox_id),
+                    externalRequestId=external_request_id)
+
     try:
         status, response_body = (
             _provider_attempt(
@@ -208,6 +201,9 @@ def _process_claim(
             )
 
         return
+
+    reach_failpoint("after_provider_response", owner, outboxId=str(outbox_id),
+                    externalRequestId=external_request_id)
 
     success, value = (
         parse_provider_success(
@@ -302,18 +298,19 @@ def main() -> None:
 
     interval = _sleep_interval()
 
-    while True:
-        try:
-            _run_connection(
-                owner
-            )
-        except (
-            psycopg.Error,
-            OSError,
-        ):
-            time.sleep(
-                interval
-            )
+    with observability_server(postgres_ready):
+        while True:
+            try:
+                _run_connection(
+                    owner
+                )
+            except (
+                psycopg.Error,
+                OSError,
+            ):
+                time.sleep(
+                    interval
+                )
 
 
 if __name__ == "__main__":

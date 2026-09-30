@@ -1,0 +1,71 @@
+{
+  "contract_version": "course-1",
+  "module": "diagnostics",
+  "action": "stalled",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "diagnostics",
+  "target_function": "stalled_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://moduledev.example/contracts/course-1/diagnostics-stalled.payload.schema.json",
+    "title": "diagnostics.stalled version 1 payload",
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://moduledev.example/contracts/course-1/diagnostics-stalled.result.schema.json",
+    "title": "diagnostics.stalled version 1 result",
+    "type": "object",
+    "required": [
+      "items"
+    ],
+    "properties": {
+      "items": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "type": "object",
+          "required": [
+            "operationId",
+            "processId",
+            "externalRequestId"
+          ],
+          "properties": {
+            "operationId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "processId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "externalRequestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "not": {
+                "pattern": "[\r\n]"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "additionalProperties": false
+  },
+  "outcomes": [
+    "FOUND"
+  ],
+  "required_policy": [
+    "diagnostics:read"
+  ],
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "timeout_ms": 2000,
+  "enabled": true,
+  "is_default": true
+}

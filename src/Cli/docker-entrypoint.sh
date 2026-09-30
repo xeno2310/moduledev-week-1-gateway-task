@@ -17,6 +17,10 @@ if [ "$#" -ne 1 ]; then
 fi
 
 
+# Forward-only Week 4 changes are checksummed by the production runner.
+# Historical 001-020 remain PostgreSQL init scripts and are never replayed.
+dotnet /app/Cli.dll migration apply /app/db/migrations/week4
+
 # ------------------------------------------------------------
 # Publish every tracked action manifest.
 #

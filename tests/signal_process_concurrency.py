@@ -63,7 +63,7 @@ def decode(raw: str, label: str):
 
 def synthetic_environment() -> dict[str, str]:
     env = {f"COURSE_{name}_PASSWORD": secrets.token_hex(24)
-           for name in ("POSTGRES", "MIGRATOR", "PUBLISHER", "RUNTIME", "WORKER", "OUTBOX", "INBOX")}
+           for name in ("POSTGRES", "MIGRATOR", "PUBLISHER", "RUNTIME", "WORKER", "OUTBOX", "INBOX", "AUTOCHECK")}
     # Unused HTTP services still have variables interpolated by Compose. Supply
     # synthetic values, never inherit credentials or an implicit local .env.
     env.update({
@@ -298,7 +298,12 @@ class Stack:
                     session_failed = True
         finally:
             if self.cleanup_armed:
-                self.compose("down", "--volumes", "--remove-orphans", "--timeout", "5", timeout=120)
+                self.compose("down", "--volumes", "--remove-orphans", "--rmi", "local",
+                             "--timeout", "5", timeout=120)
+                for image in (self.project + "-postgres:latest", self.project + "-cli:latest"):
+                    if self.run(["docker", "image", "ls", "-q", "--filter", "reference=" + image],
+                                "Cleanup image lookup"):
+                        self.run(["docker", "image", "rm", image], "Cleanup private image")
                 self.assert_no_resources("Cleanup verification")
                 print("CLEANUP | isolated project, volume and network removed", flush=True)
         require(not session_failed, "One or more psql clients failed to close cleanly")

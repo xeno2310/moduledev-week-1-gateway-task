@@ -5,6 +5,15 @@ services:
       context: .
       dockerfile: src/Postgres/Dockerfile
     environment:
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-0}"
+      COURSE_AUTOCHECK_PASSWORD: "${COURSE_AUTOCHECK_PASSWORD:?COURSE_AUTOCHECK_PASSWORD is required}"
+      # Unset policy variables stay absent; explicit values are passed through.
+      COURSE_OUTBOX_MAX_ATTEMPTS:
+      COURSE_OUTBOX_BACKOFF_BASE_MS:
+      COURSE_OUTBOX_BACKOFF_MAX_MS:
+      COURSE_OUTBOX_JITTER_MAX_MS:
+      COURSE_OUTBOX_LEASE_MS:
+      COURSE_JOB_LEASE_MS:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: "${COURSE_POSTGRES_PASSWORD:-course-local-only}"
@@ -32,6 +41,7 @@ services:
       context: .
       dockerfile: src/Api/Dockerfile
     environment:
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
       ASPNETCORE_URLS: http://+:8080
       COURSE_DB_CONNECTION: >-
         Host=postgres;
@@ -98,6 +108,8 @@ services:
       context: .
       dockerfile: src/Workflow.Worker/Dockerfile
     environment:
+      COURSE_JOB_LEASE_MS:
+      COURSE_WORKER_POLL_MS:
       COURSE_DB_CONNECTION: >-
         Host=postgres;
         Port=5432;
@@ -115,9 +127,14 @@ services:
       postgres:
         condition: service_healthy
 
+      cli:
+        condition: service_completed_successfully
+
   worker-b:
     image: moduledev-workflow-worker:local
     environment:
+      COURSE_JOB_LEASE_MS:
+      COURSE_WORKER_POLL_MS:
       COURSE_DB_CONNECTION: >-
         Host=postgres;
         Port=5432;
@@ -135,6 +152,9 @@ services:
       postgres:
         condition: service_healthy
 
+      cli:
+        condition: service_completed_successfully
+
   outbox-dispatcher:
     image: moduledev-python-perimeter:local
     build:
@@ -145,6 +165,11 @@ services:
       - -m
       - perimeter.dispatcher
     environment:
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_PROVIDER_TIMEOUT_MS:
+      COURSE_OUTBOX_LEASE_MS:
+      COURSE_OUTBOX_POLL_MS:
+      COURSE_OUTBOX_MAX_ATTEMPTS:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: course
@@ -156,8 +181,34 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      provider-simulator:
-        condition: service_started
+      cli:
+        condition: service_completed_successfully
+
+  outbox-dispatcher-b:
+    image: moduledev-python-perimeter:local
+    command:
+      - python
+      - -m
+      - perimeter.dispatcher
+    environment:
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_PROVIDER_TIMEOUT_MS:
+      COURSE_OUTBOX_LEASE_MS:
+      COURSE_OUTBOX_POLL_MS:
+      COURSE_OUTBOX_MAX_ATTEMPTS:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: course
+      PGUSER: outbox_dispatcher
+      PGPASSWORD: "${COURSE_OUTBOX_PASSWORD:-outbox-dispatcher-local-only}"
+      PROVIDER_URL: "${PROVIDER_URL:-http://provider-simulator:8081}"
+      OUTBOX_OWNER: "${OUTBOX_OWNER_B:-outbox-dispatcher-b}"
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-0}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cli:
+        condition: service_completed_successfully
 
   receipt-adapter:
     image: moduledev-python-perimeter:local
@@ -166,7 +217,7 @@ services:
       - -m
       - perimeter.adapter
     environment:
-      PORT: "8080"
+      PORT: "8082"
       PROVIDER_CALLBACK_CAPABILITY: "${PROVIDER_CALLBACK_CAPABILITY}"
       PROVIDER_CALLBACK_TOKEN: "${PROVIDER_CALLBACK_TOKEN}"
       PROVIDER_HMAC_SECRET: "${PROVIDER_HMAC_SECRET}"
@@ -182,6 +233,8 @@ services:
       - -m
       - perimeter.reconciler
     environment:
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_INBOX_POLL_MS:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: course
@@ -192,10 +245,35 @@ services:
       postgres:
         condition: service_healthy
 
+      cli:
+        condition: service_completed_successfully
+
+  inbox-reconciler-b:
+    image: moduledev-python-perimeter:local
+    command:
+      - python
+      - -m
+      - perimeter.reconciler
+    environment:
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_INBOX_POLL_MS:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: course
+      PGUSER: inbox_reconciler
+      PGPASSWORD: "${COURSE_INBOX_PASSWORD:-inbox-reconciler-local-only}"
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-0}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      cli:
+        condition: service_completed_successfully
+
   provider-simulator:
     image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0@sha256:70e5e0dd9ab8425be84de431ec74516f9bedf5d5529077358e2e2b2037fe0c74
     environment:
-      CALLBACK_URL: "http://receipt-adapter:8080/callbacks/provider-v02/${PROVIDER_CALLBACK_CAPABILITY}"
+      CALLBACK_URL: "http://receipt-adapter:8082/callbacks/provider-v02/${PROVIDER_CALLBACK_CAPABILITY}"
       SIMULATOR_MODE: "${SIMULATOR_MODE:-success}"
       CALLBACK_DELAY: "${CALLBACK_DELAY:-200ms}"
       CALLBACK_TIMEOUT: "${CALLBACK_TIMEOUT:-1s}"

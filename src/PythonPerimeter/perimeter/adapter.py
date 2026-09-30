@@ -4,10 +4,6 @@ import http.client
 import os
 import socket
 import urllib.parse
-from http.server import (
-    BaseHTTPRequestHandler,
-    ThreadingHTTPServer,
-)
 
 from .common import (
     ContractError,
@@ -16,6 +12,10 @@ from .common import (
     hmac_signature,
     parse_json_object,
     receipt_from_legacy,
+    ADAPTER_PORT,
+    ObservabilityHandler,
+    ObservabilityServer,
+    integer_setting,
 )
 
 
@@ -36,6 +36,39 @@ def _api_timeout() -> float:
     )
 
 
+def _gateway_endpoint() -> tuple[str, int, str]:
+    try:
+        parsed = urllib.parse.urlsplit(os.environ.get(
+            "RECEIPT_API_URL", "http://gateway:8080/api/receipt/accept"))
+        port = parsed.port if parsed.port is not None else 80
+        if (parsed.scheme != "http" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or not 1 <= port <= 65535):
+            raise ValueError()
+        return parsed.hostname, port, parsed.path or "/"
+    except ValueError:
+        raise OSError("invalid API URL") from None
+
+
+def gateway_ready() -> bool:
+    connection = None
+    try:
+        host, port, _ = _gateway_endpoint()
+        connection = http.client.HTTPConnection(host, port, timeout=2)
+        # This request carries no callback body, credentials, or HMAC headers.
+        connection.request("GET", "/health/ready")
+        response = connection.getresponse()
+        body = response.read(2049)
+        return (response.status == 200 and len(body) <= 2048
+                and (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower() == "application/json"
+                and parse_json_object(body) == {"status": "ready"})
+    except Exception:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def _post_receipt(
     body: bytes,
     message_id: str,
@@ -44,10 +77,7 @@ def _post_receipt(
     bytes,
     str | None,
 ]:
-    api_url = os.environ.get(
-        "RECEIPT_API_URL",
-        "http://gateway:8080/api/receipt/accept",
-    )
+    host, port, path = _gateway_endpoint()
 
     token = os.environ[
         "PROVIDER_CALLBACK_TOKEN"
@@ -57,26 +87,6 @@ def _post_receipt(
         "PROVIDER_HMAC_SECRET"
     ]
 
-    parsed = urllib.parse.urlsplit(
-        api_url
-    )
-
-    if (
-        parsed.scheme != "http"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise OSError(
-            "invalid API URL"
-        )
-
-    port = parsed.port or 80
-
-    path = parsed.path or "/"
-
     signature = hmac_signature(
         secret,
         body,
@@ -84,7 +94,7 @@ def _post_receipt(
 
     connection = (
         http.client.HTTPConnection(
-            parsed.hostname,
+            host,
             port,
             timeout=_api_timeout(),
         )
@@ -155,9 +165,10 @@ def _post_receipt(
 
 
 class CallbackHandler(
-    BaseHTTPRequestHandler
+    ObservabilityHandler
 ):
     protocol_version = "HTTP/1.1"
+    readiness = staticmethod(gateway_ready)
 
     def log_message(
         self,
@@ -209,9 +220,7 @@ class CallbackHandler(
         )
 
     def do_GET(self) -> None:
-        self._empty(
-            404
-        )
+        super().do_GET()
 
     def do_PUT(self) -> None:
         self._empty(
@@ -399,14 +408,10 @@ def main() -> None:
                 f"{name} is required"
             )
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "8080",
-        )
-    )
+    _gateway_endpoint()
+    port = integer_setting("PORT", ADAPTER_PORT, 1, 65535)
 
-    server = ThreadingHTTPServer(
+    server = ObservabilityServer(
         (
             "0.0.0.0",
             port,
@@ -414,7 +419,10 @@ def main() -> None:
         CallbackHandler,
     )
 
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

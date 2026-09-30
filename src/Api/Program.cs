@@ -100,42 +100,11 @@ builder.Services.AddAuthorization();
 var app = builder.Build();
 
 
-app.MapGet("/health/live", () =>
-{
-    return Results.Ok(new
-    {
-        status = "ok"
-    });
-});
-
-
-app.MapGet("/health/ready", async () =>
-{
-    try
-    {
-        await using var connection =
-            new NpgsqlConnection(connectionString);
-
-        await connection.OpenAsync();
-
-        await using var command =
-            new NpgsqlCommand(
-                "SELECT 1",
-                connection);
-
-        await command.ExecuteScalarAsync();
-
-        return Results.Ok(new
-        {
-            status = "ready"
-        });
-    }
-    catch
-    {
-        return Results.StatusCode(
-            StatusCodes.Status503ServiceUnavailable);
-    }
-});
+app.MapGet("/health/live", () => Results.Text("{\"status\":\"live\"}", "application/json"));
+app.MapGet("/health/ready", (CancellationToken token) =>
+    ApiObservability.ReadyAsync(connectionString, token));
+app.MapGet("/metrics", (CancellationToken token) =>
+    ApiObservability.MetricsAsync(connectionString, token));
 
 
 app.UseAuthentication();
@@ -171,8 +140,9 @@ app.MapGet(
             return Results.Json(
                 BuildOpenApiDocument(definitions));
         }
-        catch (NpgsqlException)
+        catch (NpgsqlException error)
         {
+            ApiPoolRecovery.InvalidateOnFailure(error);
             return Error(
                 503,
                 "dependency.unavailable",
@@ -213,8 +183,9 @@ app.MapGet(
                 BuildOpenApiDocument(
                     new[] { definition }));
         }
-        catch (NpgsqlException)
+        catch (NpgsqlException error)
         {
+            ApiPoolRecovery.InvalidateOnFailure(error);
             return Error(
                 503,
                 "dependency.unavailable",
@@ -276,8 +247,9 @@ static async Task<IResult> ExecuteActionAsync(
                 requestedVersion,
                 http.RequestAborted);
     }
-    catch (NpgsqlException)
+    catch (NpgsqlException error)
     {
+        ApiPoolRecovery.InvalidateOnFailure(error);
         return Error(
             503,
             "dependency.unavailable",
@@ -720,9 +692,15 @@ static async Task<IResult> ExecuteActionAsync(
                 var resultCopy =
                     resultElement.Clone();
 
+                await ReachFailpointAsync(
+                    "after_manual_decision");
+
                 await transaction
                     .CommitAsync(
                         http.RequestAborted);
+
+                await ReachFailpointAsync(
+                    "after_inbox_saved");
 
                 // Meta формируем сами.
                 // Target не может подменить correlationId/version.
@@ -764,8 +742,9 @@ static async Task<IResult> ExecuteActionAsync(
                 correlationId,
                 definition.Version);
         }
-        catch (NpgsqlException)
+        catch (NpgsqlException error)
         {
+            ApiPoolRecovery.InvalidateOnFailure(error);
             return Error(
                 503,
                 "dependency.unavailable",
@@ -794,6 +773,24 @@ static async Task<IResult> ExecuteActionAsync(
                 definition.Version);
         }
     }
+}
+
+static async Task ReachFailpointAsync(string name)
+{
+    if (Environment.GetEnvironmentVariable("COURSE_TEST_PROFILE") != "1"
+        || !string.Equals(Environment.GetEnvironmentVariable("COURSE_FAILPOINT"),
+            name, StringComparison.Ordinal))
+        return;
+
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        @event = "failpoint.reached",
+        name,
+        instanceId = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("HOSTNAME"))
+            ? "api" : Environment.GetEnvironmentVariable("HOSTNAME")
+    }));
+    await Console.Out.FlushAsync();
+    await Task.Delay(Timeout.InfiniteTimeSpan);
 }
 
 
@@ -1237,7 +1234,9 @@ static IResult ErrorFromAction(
             "access.denied" => 403,
             "receipt.signature_required" => 403,
             "action.not_found" => 404,
+            "diagnostics.trace_not_found" => 404,
             "idempotency.conflict" => 409,
+            "diagnostics.trace_ambiguous" => 409,
             "workflow.decision_conflict" => 409,
             "action.contract_violation" => 500,
             "action.timeout" => 504,
@@ -1626,6 +1625,97 @@ sealed record OpenApiAction(
     JsonElement ResponseSchema,
     string[] Outcomes,
     string IdempotencyMode);
+
+public sealed record ApiMetricSnapshot(long JobsReady, double JobOldestAgeSeconds,
+    long ProcessesWaiting, long OutboxPending, double OutboxOldestAgeSeconds, long FailuresTotal);
+
+public static class ApiPoolRecovery
+{
+    public static void InvalidateOnFailure(Exception error, Action? clearPools = null)
+    {
+        if (error is not (NpgsqlException or TimeoutException or OperationCanceledException)) return;
+        // This process owns API pools only. Npgsql closes idle connectors now;
+        // busy connectors are discarded on return, without aborting/replaying
+        // active transactions. Concurrent invalidations are safe. No action is
+        // retried and successful readiness probes never clear the pool.
+        (clearPools ?? NpgsqlConnection.ClearAllPools)();
+    }
+}
+
+public static class ApiObservability
+{
+    public const string MetricsContentType = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+    private static NpgsqlConnection ProbeConnection(string connectionString) => new(
+        new NpgsqlConnectionStringBuilder(connectionString)
+        {
+            Pooling = false, Timeout = 2, CommandTimeout = 2, CancellationTimeout = 500
+        }.ConnectionString);
+
+    private static IResult Unavailable() => Results.Text(
+        "{\"status\":\"not_ready\",\"code\":\"dependency.unavailable\"}",
+        "application/json", statusCode: 503);
+
+    public static async Task<IResult> ReadyAsync(string connectionString, CancellationToken token)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            await using var connection = ProbeConnection(connectionString);
+            await connection.OpenAsync(timeout.Token);
+            await using var command = new NpgsqlCommand("SELECT 1", connection);
+            await command.ExecuteScalarAsync(timeout.Token);
+            return Results.Text("{\"status\":\"ready\"}", "application/json");
+        }
+        catch (Exception error)
+        {
+            if (!token.IsCancellationRequested)
+                ApiPoolRecovery.InvalidateOnFailure(error);
+            return Unavailable();
+        }
+    }
+
+    public static async Task<IResult> MetricsAsync(string connectionString, CancellationToken token)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            await using var connection = ProbeConnection(connectionString);
+            await connection.OpenAsync(timeout.Token);
+            // No direct table privileges and no cached business values.
+            await using var command = new NpgsqlCommand("SELECT * FROM api.observability_metrics()", connection);
+            await using var reader = await command.ExecuteReaderAsync(timeout.Token);
+            if (!await reader.ReadAsync(timeout.Token)) throw new InvalidOperationException();
+            var snapshot = new ApiMetricSnapshot(reader.GetInt64(0), reader.GetDouble(1),
+                reader.GetInt64(2), reader.GetInt64(3), reader.GetDouble(4), reader.GetInt64(5));
+            return Results.Text(Render(snapshot), MetricsContentType);
+        }
+        catch (Exception error)
+        {
+            if (!token.IsCancellationRequested)
+                ApiPoolRecovery.InvalidateOnFailure(error);
+            return Unavailable();
+        }
+    }
+
+    public static string Render(ApiMetricSnapshot value)
+    {
+        if (value.JobsReady < 0 || value.ProcessesWaiting < 0 || value.OutboxPending < 0 || value.FailuresTotal < 0
+            || !double.IsFinite(value.JobOldestAgeSeconds) || value.JobOldestAgeSeconds < 0
+            || !double.IsFinite(value.OutboxOldestAgeSeconds) || value.OutboxOldestAgeSeconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(value));
+        var culture = System.Globalization.CultureInfo.InvariantCulture;
+        return "# TYPE workflow_jobs_ready gauge\nworkflow_jobs_ready " + value.JobsReady.ToString(culture)
+            + "\n# TYPE workflow_job_oldest_age_seconds gauge\nworkflow_job_oldest_age_seconds " + value.JobOldestAgeSeconds.ToString("R", culture)
+            + "\n# TYPE workflow_processes_waiting gauge\nworkflow_processes_waiting " + value.ProcessesWaiting.ToString(culture)
+            + "\n# TYPE outbox_pending gauge\noutbox_pending " + value.OutboxPending.ToString(culture)
+            + "\n# TYPE outbox_oldest_age_seconds gauge\noutbox_oldest_age_seconds " + value.OutboxOldestAgeSeconds.ToString("R", culture)
+            + "\n# TYPE workflow_failures counter\nworkflow_failures_total " + value.FailuresTotal.ToString(culture)
+            + "\n# EOF\n";
+    }
+}
 
 static class SchemaCache
 {
