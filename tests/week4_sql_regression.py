@@ -1,4 +1,4 @@
-"""Eight isolated Week 4 SQL regressions. Run from the repository root.
+"""Isolated Week 4 SQL regressions. Run from the repository root.
 
 Only PostgreSQL and CLI are built/started. Production CLI publishes the tracked
 actions/maps and applies only forward migrations. Domain writes go through
@@ -13,6 +13,7 @@ import argparse
 import hashlib
 from pathlib import Path
 import re
+import shutil
 import signal
 import tempfile
 import time
@@ -33,11 +34,14 @@ FORWARD_FILES = (
     "024_week4_job_lease_heartbeat.sql",
     "025_diagnostics_stalled.sql",
     "026_diagnostics_trace.sql",
+    "027_workflow_lease_expiry_fencing.sql",
+    "028_diagnostics_stalled_threshold.sql",
 )
 SCENARIOS = (
     "reader-privileges", "migration-repeat", "retry-backoff-dead",
     "expired-lease-budget", "late-receipt-preserves-dead-evidence",
     "reconcile-concurrency-commit", "reconcile-concurrency-rollback", "job-lease-heartbeat",
+    "expired-finish-before-reclaim", "expired-fail-before-reclaim", "upgrade-026-to-028",
 )
 VIEWS = (
     "contract_info", "action_definitions", "action_dispatches", "operations", "operation_events",
@@ -47,12 +51,12 @@ VIEWS = (
 REPLACED = (
     "delivery.claim_outbox(text,integer)", "delivery.fail_outbox(uuid,text,bigint,text)",
     "delivery.reconcile_inbox(integer)", "workflow.claim_jobs(text,integer,integer)",
+    "workflow.finish_job(uuid,text,bigint,text,jsonb)",
+    "workflow.fail_job(uuid,text,bigint,text,boolean)",
 )
 PRESERVED = (
     "delivery.succeed_outbox(uuid,text,bigint,text)", "receipt.accept_v1(jsonb,jsonb)",
     "workflow.signal_process(uuid,text,text,jsonb,text)",
-    "workflow.finish_job(uuid,text,bigint,text,jsonb)",
-    "workflow.fail_job(uuid,text,bigint,text,boolean)",
 )
 
 
@@ -99,9 +103,14 @@ class Stack(BaseStack):
         })
         self.tags = [self.project + "-" + name + ":phase1" for name in ("postgres", "cli")]
         self.images_owned = False
+        legacy = directory / "legacy-migrations"
+        legacy.mkdir()
+        for name in FORWARD_FILES[:6]:
+            shutil.copyfile(MIGRATIONS / name, legacy / name)
         override = directory / "compose.json"
         override.write_text(compact({"services": {
-            name: {"image": tag} for name, tag in zip(("postgres", "cli"), self.tags)
+            "postgres": {"image": self.tags[0]},
+            "cli": {"image": self.tags[1], "volumes": [str(legacy) + ":/app/db/migrations/legacy:ro"]},
         }}), encoding="utf-8")
         self.prefix += ["-f", str(override)]
 
@@ -206,11 +215,21 @@ def migration_repeat(stack: Stack, db: PsqlSession, baseline: list) -> None:
             name = before["name"].split("(")[0]
             path = MIGRATIONS / ("022_fix_reconcile_inbox_applied_count.sql" if "reconcile_inbox" in name
                                  else "024_week4_job_lease_heartbeat.sql" if "claim_jobs" in name
+                                 else "027_workflow_lease_expiry_fencing.sql" if name in
+                                 {"workflow.finish_job", "workflow.fail_job"}
                                  else "021_week4_delivery_policy.sql")
             match = re.search(r"CREATE OR REPLACE FUNCTION " + re.escape(name)
                               + r"\(.*?AS \$\$(.*?)\$\$;", path.read_text(encoding="utf-8"), re.S)
             require(match is not None and after["body"].replace("\r\n", "\n").strip() == match[1].strip(),
                     "Installed forward function body differs")
+    for row in installed:
+        if row["name"].startswith(("workflow.finish_job(", "workflow.fail_job(")):
+            require({k: row[k] for k in ("owner", "definer", "config", "volatility", "language")} == {
+                "owner": "course_owner", "definer": True,
+                "config": ["search_path=pg_catalog, workflow"], "volatility": "v", "language": "plpgsql"},
+                "Workflow function security metadata differs")
+            require(row["acl"] == next(old["acl"] for old in baseline if old["name"] == row["name"]),
+                    "Workflow function ACL changed")
     renewal = renewal_metadata(db)
     expected = [{"file_name": p.name, "checksum": hashlib.sha256(p.read_bytes()).hexdigest()}
                 for p in forward_files()]
@@ -331,6 +350,196 @@ def job_lease_heartbeat(stack: Stack, db: PsqlSession) -> None:
     require(terminal['job']['state'] != 'LEASED' and renew('lease-b', second['lease_version']) is False
             and evidence() == terminal, "Terminal job accepted renewal")
     print("EVIDENCE | taskTimeoutMs=30000 claimLeaseMs=2000 renewal=fenced counters=unchanged ACL=worker-only", flush=True)
+
+
+def expiry_snapshot(db: PsqlSession) -> dict:
+    # The isolated fixture owns this database. Include business, workflow,
+    # delivery and idempotency history, not just the leased job row.
+    tables = (("payment", "operations"), ("payment", "operation_events"),
+              ("payment", "external_requests"), ("payment", "decisions"),
+              ("workflow", "process_instances"), ("workflow", "step_instances"),
+              ("workflow", "workflow_jobs"), ("workflow", "task_attempts"),
+              ("workflow", "workflow_events"), ("delivery", "outbox"),
+              ("catalog", "idempotency_records"), ("catalog", "action_dispatches"))
+    entries = [sql_text(schema + "." + table) + ","
+               + "(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)::text COLLATE \"C\"),"
+               + "'[]'::jsonb) FROM " + schema + "." + table + " r)"
+               for schema, table in tables]
+    return db.json("SELECT jsonb_build_object(" + ",".join(entries) + ");", "expiry evidence")
+
+
+def expiry_job(db: PsqlSession, owner: str) -> tuple[dict, str, str]:
+    operation = invoke(db, "payment", "request", {
+        "operationKind": "PAYMENT_EXECUTION", "amount": "10.00", "currency": "RUB"})["operationId"]
+    process = invoke(db, "payment", "submit", {"operationId": operation})["processId"]
+    run_job(db, operation, process, "validate")
+    rows = boundary(db, "workflow_worker", "COALESCE((SELECT jsonb_agg(to_jsonb(j)) "
+                    "FROM workflow.claim_jobs(" + sql_text(owner) + ",1,2000) j),'[]'::jsonb)")
+    require(len(rows) == 1 and rows[0]["process_id"] == process
+            and rows[0]["action"] == "prepare_external", "Wrong expiry fixture job")
+    return rows[0], operation, process
+
+
+def wait_job_expired(db: PsqlSession, job: dict) -> None:
+    deadline = time.monotonic() + 10
+    query = ("SELECT to_jsonb(lease_until <= clock_timestamp()) FROM workflow.workflow_jobs "
+             "WHERE job_id=" + sql_text(job["job_id"]) + "::uuid;")
+    while time.monotonic() < deadline:
+        if db.json(query, "job lease expiry", timeout=max(0.001, deadline-time.monotonic())) is True:
+            return
+    raise CheckFailed("Job lease expiry barrier exceeded 10 seconds")
+
+
+def prepare_and_finish(db: PsqlSession, job: dict, operation: str, process: str,
+                       owner: str, rollback: bool = False) -> dict:
+    ctx = context()
+    ctx.update({"principal": "workflow-worker", "consumer": "workflow-worker",
+                "requestId": job["execution_id"], "processId": process,
+                "jobId": job["job_id"], "executionId": job["execution_id"],
+                "attemptId": job["attempt_id"]})
+    expression = ("WITH invoked AS MATERIALIZED (SELECT api.invoke('payment','prepare_external',1,"
+                  + sql_json(ctx) + "," + sql_json({"operationId": operation}) + ") AS envelope) "
+                  "SELECT workflow.finish_job(" + sql_text(job["job_id"]) + "::uuid,"
+                  + sql_text(owner) + "," + str(job["lease_version"])
+                  + ",envelope->>'outcome',envelope->'result') FROM invoked "
+                  "WHERE envelope->>'status'='ok';")
+    if rollback:
+        raw = db.execute("BEGIN; SET LOCAL ROLE workflow_worker; " + expression + " ROLLBACK;",
+                         "expired action and finish rollback")
+        return decode(raw, "expired action and finish rollback")
+    return boundary(db, "workflow_worker", "(" + expression.removesuffix(";") + ")")
+
+
+def expired_job_boundary(db: PsqlSession, failing: bool) -> None:
+    owner = "expired-fail" if failing else "expired-finish"
+    first, operation, process = expiry_job(db, owner)
+    before = expiry_snapshot(db)
+    job_id = sql_text(first["job_id"]) + "::uuid"
+    process_succeeded = ("SELECT to_jsonb(count(*)) FROM workflow.workflow_events "
+                         "WHERE process_id=" + sql_text(process) + "::uuid "
+                         "AND event_type='TaskSucceeded';")
+    target_events = ("SELECT COALESCE(jsonb_agg(jsonb_build_object("
+                     "'stepInstanceId',e.step_instance_id::text,'metadata',e.metadata) "
+                     "ORDER BY e.event_id),'[]'::jsonb) FROM workflow.workflow_events e "
+                     "WHERE e.process_id=" + sql_text(process) + "::uuid "
+                     "AND e.step_instance_id=" + sql_text(first["step_instance_id"]) + "::uuid "
+                     "AND e.event_type='TaskSucceeded' "
+                     "AND e.metadata->>'jobId'=" + sql_text(first["job_id"]) + " "
+                     "AND e.metadata->>'executionId'=" + sql_text(first["execution_id"]) + ";")
+    effects = ("SELECT jsonb_build_object('externalRequests',"
+               "(SELECT count(*) FROM payment.external_requests x WHERE x.operation_id="
+               + sql_text(operation) + "::uuid),'outboxRows',"
+               "(SELECT count(*) FROM delivery.outbox d JOIN payment.external_requests x "
+               "USING(external_request_id) WHERE x.operation_id="
+               + sql_text(operation) + "::uuid));")
+    baseline_succeeded = db.json(process_succeeded, "process success baseline")
+    require(baseline_succeeded >= 1 and db.json(target_events, "target success baseline") == []
+            and db.json(effects, "effect baseline") == {"externalRequests": 0, "outboxRows": 0},
+            "Expiry fixture already has the target result or effect")
+    wait_job_expired(db, first)
+    if failing:
+        stale = boundary(db, "workflow_worker", "workflow.fail_job(" + job_id + ","
+                         + sql_text(owner) + "," + str(first["lease_version"])
+                         + ",'expiry.probe',true)")
+    else:
+        stale = boundary(db, "workflow_worker", "workflow.finish_job(" + job_id + ","
+                         + sql_text(owner) + "," + str(first["lease_version"])
+                         + ",'PREPARED','{}'::jsonb)")
+    require(stale.get("status") == "error" and stale.get("code") == "workflow.lease_stale"
+            and expiry_snapshot(db) == before, "Expired boundary changed business or history evidence")
+    require(db.json(process_succeeded, "success after stale boundary") == baseline_succeeded
+            and db.json(target_events, "target after stale boundary") == []
+            and db.json(effects, "effect after stale boundary") ==
+            {"externalRequests": 0, "outboxRows": 0},
+            "Expired boundary created a terminal event or domain effect")
+    if not failing:
+        # Same SQL transaction shape as Worker: action effect is still open
+        # when finish returns stale; rollback leaves no external request.
+        stale = prepare_and_finish(db, first, operation, process, owner, rollback=True)
+        require(stale.get("code") == "workflow.lease_stale" and expiry_snapshot(db) == before,
+                "Expired action/finish transaction retained an effect")
+        require(db.json(process_succeeded, "success after rollback") == baseline_succeeded
+                and db.json(target_events, "target after rollback") == []
+                and db.json(effects, "effect after rollback") ==
+                {"externalRequests": 0, "outboxRows": 0},
+                "Rollback retained a terminal event or domain effect")
+    rows = boundary(db, "workflow_worker", "COALESCE((SELECT jsonb_agg(to_jsonb(j)) "
+                    "FROM workflow.claim_jobs('reclaimed-owner',1,2000) j),'[]'::jsonb)")
+    require(len(rows) == 1 and rows[0]["job_id"] == first["job_id"]
+            and rows[0]["process_id"] == first["process_id"]
+            and rows[0]["step_instance_id"] == first["step_instance_id"]
+            and rows[0]["execution_id"] == first["execution_id"]
+            and rows[0]["attempt_id"] != first["attempt_id"]
+            and rows[0]["lease_version"] > first["lease_version"], "Reclaim identity/fence differs")
+    second = rows[0]
+    ok(prepare_and_finish(db, second, operation, process, "reclaimed-owner"),
+       "New lease action and finish")
+    final = db.json("SELECT jsonb_build_object('jobState',j.state,'failureCount',j.failure_count,"
+                    "'attemptCount',j.attempt_count,"
+                    "'attempts',(SELECT jsonb_agg(jsonb_build_object('attemptId',a.attempt_id::text,"
+                    "'executionId',a.execution_id::text,'leaseVersion',a.lease_version,"
+                    "'status',a.status,'finished',a.finished_at IS NOT NULL) ORDER BY a.attempt_number) "
+                    "FROM workflow.task_attempts a WHERE a.job_id=j.job_id),"
+                    "'processTerminalEvents',(SELECT count(*) FROM workflow.workflow_events e "
+                    "WHERE e.process_id=j.process_id AND e.event_type='TaskSucceeded')) "
+                    "FROM workflow.workflow_jobs j WHERE j.job_id=" + job_id + ";", "terminal evidence")
+    require(final == {"jobState": "SUCCEEDED", "failureCount": 0, "attemptCount": 2,
+                      "attempts": [
+                          {"attemptId": first["attempt_id"], "executionId": first["execution_id"],
+                           "leaseVersion": first["lease_version"], "status": "STALE", "finished": True},
+                          {"attemptId": second["attempt_id"], "executionId": second["execution_id"],
+                           "leaseVersion": second["lease_version"], "status": "SUCCEEDED", "finished": True}],
+                      "processTerminalEvents": baseline_succeeded + 1},
+            "Reclaimed job did not finish exactly once")
+    events = db.json(target_events, "authoritative target success event")
+    require(events == [{"stepInstanceId": second["step_instance_id"], "metadata": {
+        "processId": process, "jobId": second["job_id"],
+        "executionId": second["execution_id"], "attemptId": second["attempt_id"],
+        "leaseVersion": second["lease_version"], "outcome": "PREPARED"}}]
+            and db.json(effects, "single prepared effect") ==
+            {"externalRequests": 1, "outboxRows": 1},
+            "Authoritative attempt event or domain effect is not unique")
+    print("EVIDENCE | expired=" + ("fail" if failing else "finish")
+          + " stale=workflow.lease_stale baselineTaskSucceeded=" + str(baseline_succeeded)
+          + " targetEvents=1 externalRequests=1 outboxRows=1"
+          + " leaseVersion=" + str(first["lease_version"]) + "->" + str(second["lease_version"])
+          + " executionIdStable=true", flush=True)
+
+
+def upgrade_026_to_028(directory: Path) -> None:
+    directory.mkdir()
+    stack = Stack(directory)
+    try:
+        stack.start()
+        db = PsqlSession(stack, "upgrade-observer")
+        baseline = metadata(db)
+        result = stack.cli("migration", "apply", "/app/db/migrations/legacy")["result"]
+        require(result["applied"] == 6 and result["skipped"] == 0, "026 baseline not applied")
+        at_026 = metadata(db)
+        stalled_query = ("SELECT jsonb_build_object('oid',p.oid,'owner',pg_get_userbyid(p.proowner),"
+                         "'acl',p.proacl::text,'definer',p.prosecdef,'language',l.lanname,"
+                         "'volatility',p.provolatile,'config',p.proconfig,'body',p.prosrc) "
+                         "FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang "
+                         "WHERE p.oid='diagnostics.stalled_v1(jsonb,jsonb)'::regprocedure;")
+        stalled_at_026 = db.json(stalled_query, "stalled catalog at 026")
+        result = stack.cli("migration", "apply", "/app/db/migrations/week4")["result"]
+        require(result["applied"] == 2 and result["skipped"] == 6, "026 to 028 upgrade differs")
+        upgraded = metadata(db)
+        stalled_upgraded = db.json(stalled_query, "stalled catalog after 028")
+        require(all({k: a[k] for k in a if k != "body"} ==
+                    {k: b[k] for k in b if k != "body"} for a, b in zip(at_026, upgraded)),
+                "Upgrade changed function identity/security")
+        require({k: stalled_at_026[k] for k in stalled_at_026 if k != "body"} ==
+                {k: stalled_upgraded[k] for k in stalled_upgraded if k != "body"},
+                "Upgrade changed stalled OID/owner/ACL/security")
+        require(len(baseline) == len(upgraded), "Upgrade changed function set")
+        result = stack.cli("migration", "apply", "/app/db/migrations/week4")["result"]
+        require(result["applied"] == 0 and result["skipped"] == 8,
+                "Upgrade repeated apply did not skip eight migrations")
+        require(metadata(db) == upgraded and db.json(stalled_query, "repeated stalled catalog") == stalled_upgraded,
+                "Repeated upgrade changed function metadata")
+    finally:
+        stack.cleanup()
 
 
 def context() -> dict:
@@ -586,6 +795,9 @@ def main() -> int:
                     lambda: retry_backoff_dead(db), lambda: expired_lease_budget(db),
                     lambda: late_receipt(db), lambda: reconcile_race(stack, db, False),
                     lambda: reconcile_race(stack, db, True), lambda: job_lease_heartbeat(stack, db),
+                    lambda: expired_job_boundary(db, False),
+                    lambda: expired_job_boundary(db, True),
+                    lambda: upgrade_026_to_028(Path(directory) / "upgrade"),
                 )
                 for name, action in zip(SCENARIOS, actions):
                     print("RUN | " + name, flush=True)

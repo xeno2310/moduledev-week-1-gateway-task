@@ -422,6 +422,10 @@ def manual_crash(stack: Stack) -> None:
                            + sql_text(steps[0]["step_instance_id"])) == [{"state": "WAITING"}],
             "Manual step changed despite transaction rollback")
     stack.recover("api")
+    stack.until(
+        "API readiness after recovery",
+        lambda: stack.http("GET", "/health/ready")[0] == 200,
+    )
     code, envelope = stack.action("workflow", "manual", payload, token=token, key=key)
     require(code == 200 and envelope.get("status") == "ok",
             "Same authoritative manual command did not recover")

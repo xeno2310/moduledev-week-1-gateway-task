@@ -27,7 +27,8 @@ from week3_e2e import make_token, synthetic_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "manifests/diagnostics-stalled-v1.action.json"
-MIGRATION = ROOT / "db/migrations/week4/025_diagnostics_stalled.sql"
+MIGRATION = ROOT / "db/migrations/week4/028_diagnostics_stalled_threshold.sql"
+THRESHOLD_SECONDS = 30
 SCENARIOS = ("registration-acl-repeat", "empty-read-only", "single-exhausted-delivery",
              "multiple-unique-ordered", "exclude-non-dead-and-unrelated",
              "late-receipt-and-terminal-chains", "payload-and-access",
@@ -180,6 +181,29 @@ def exhaust(db: PsqlSession) -> dict:
     return item
 
 
+def dead_age(db: PsqlSession, item: dict) -> float:
+    evidence = db.json("SELECT jsonb_build_object('deadAt',dead_at,'age',"
+                       "extract(epoch FROM (statement_timestamp()-dead_at))) "
+                       "FROM delivery.outbox WHERE outbox_id=" + sql_text(item['outbox']) + "::uuid;",
+                       "persisted DEAD age")
+    require(isinstance(evidence, dict) and evidence['deadAt'] is not None
+            and isinstance(evidence['age'], (int, float)), "DEAD has no durable timestamp")
+    return float(evidence['age'])
+
+
+def wait_dead_age(db: PsqlSession, item: dict, seconds: float) -> None:
+    # Query the same server clock and durable dead_at used by the action.
+    deadline = time.monotonic() + 45
+    last_age = 0.0
+    while time.monotonic() < deadline:
+        last_age = dead_age(db, item)
+        if last_age >= seconds:
+            print(f"AGE | target={seconds:.1f}s actual={last_age:.3f}s", flush=True)
+            return
+        time.sleep(min(0.1, max(0.01, seconds - last_age)))
+    raise CheckFailed(f"DEAD age barrier exceeded 45 seconds; last server age={last_age:.3f}s")
+
+
 def registration(stack: Stack, db: PsqlSession) -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     registered = db.json("SELECT to_jsonb(a) FROM catalog.action_definitions a "
@@ -320,10 +344,24 @@ def main() -> int:
                     elif name == "empty-read-only":
                         read_stalled(stack, db, [])
                     elif name == "single-exhausted-delivery":
-                        stalled.append(exhaust(db))
+                        fresh = exhaust(db)
+                        require(dead_age(db, fresh) < THRESHOLD_SECONDS, "Fixture was not fresh")
+                        read_stalled(stack, db, [])
+                        wait_dead_age(db, fresh, THRESHOLD_SECONDS / 2)
+                        require(dead_age(db, fresh) < THRESHOLD_SECONDS,
+                                "Pre-threshold observation crossed the boundary")
+                        read_stalled(stack, db, [])
+                        wait_dead_age(db, fresh, THRESHOLD_SECONDS)
+                        stalled.append(fresh)
                         read_stalled(stack, db, [expected_item(i) for i in stalled])
                     elif name == "multiple-unique-ordered":
-                        stalled.extend(exhaust(db) for _ in range(2))
+                        fresh = [exhaust(db) for _ in range(2)]
+                        require(all(dead_age(db, item) < THRESHOLD_SECONDS for item in fresh),
+                                "Mixed-age fixtures were not fresh")
+                        read_stalled(stack, db, [expected_item(i) for i in stalled])
+                        for item in fresh:
+                            wait_dead_age(db, item, THRESHOLD_SECONDS)
+                        stalled.extend(fresh)
                         read_stalled(stack, db, [expected_item(i) for i in stalled])
                     elif name == "exclude-non-dead-and-unrelated":
                         non_dead(stack, db, [expected_item(i) for i in stalled])
@@ -334,6 +372,9 @@ def main() -> int:
                     else:
                         item = exhaust(db)
                         expected = [expected_item(item)]
+                        require(dead_age(db, item) < THRESHOLD_SECONDS, "Restart fixture was not fresh")
+                        read_stalled(stack, db, [])
+                        wait_dead_age(db, item, THRESHOLD_SECONDS)
                         read_stalled(stack, db, expected)
                         before = snapshot(db)
                         history = db.json("SELECT jsonb_agg(to_jsonb(m) ORDER BY file_name) "
@@ -354,6 +395,16 @@ def main() -> int:
                                                    "FROM public.course_schema_migrations m;", "migration history")
                                 == history, "Restart changed durable diagnostics evidence")
                         read_stalled(stack, restarted, expected)
+                        fresh = exhaust(restarted)
+                        require(dead_age(restarted, fresh) < THRESHOLD_SECONDS,
+                                "Post-restart fixture was not fresh")
+                        read_stalled(stack, restarted, expected)
+                        wait_dead_age(restarted, fresh, THRESHOLD_SECONDS / 2)
+                        require(dead_age(restarted, fresh) < THRESHOLD_SECONDS,
+                                "Post-restart pre-threshold observation crossed the boundary")
+                        read_stalled(stack, restarted, expected)
+                        wait_dead_age(restarted, fresh, THRESHOLD_SECONDS)
+                        read_stalled(stack, restarted, expected + [expected_item(fresh)])
                     passed += 1
                     print("PASS | " + name, flush=True)
             finally:

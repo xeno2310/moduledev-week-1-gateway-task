@@ -1,13 +1,13 @@
 # ModuleDev Week 4 — reliability and recovery
 
-Решение в одном репозитории: Week 1 — PostgreSQL action catalog и generic Gateway/API; Week 2 — workflow и workers; Week 3 — Python payment perimeter с Outbox/Inbox; Week 4 — конкурентная доставка, recovery, observability и diagnostics. PostgreSQL хранит durable runtime. Текущий кандидат: ветка `week4-reliability`; официальный Week 4 checker — **139/139 PASS, exit 0**. Результаты ниже относятся к рабочему дереву, не к будущему commit.
+Решение в одном репозитории: Week 1 — PostgreSQL action catalog и generic Gateway/API; Week 2 — workflow и workers; Week 3 — Python payment perimeter с Outbox/Inbox; Week 4 — конкурентная доставка, recovery, observability и diagnostics. PostgreSQL хранит durable runtime. Ветка `week4-review-fix` — текущий portfolio/recheck candidate после независимой проверки исходного submission `846e156cae8b56b804becf4763353ed95bcc0b2d`. Исторический официальный checker исходного submission — **139/139 PASS, exit 0**. Официальный Week 4 checker непосредственно на текущем рабочем дереве также завершился **139/139 PASS, non-passed=0, exit 0**; остальные suites подтверждены отдельными последовательными прогонами. Единый непрерывный `./check.sh` на текущем candidate не завершился успешно из-за внешних сбоев среды и затем исправленного readiness race в crash-matrix harness. Состав evidence приведён ниже.
 
 ## Архитектура
 
 | Compose service | Ответственность |
 |---|---|
 | `postgres` | База `course`, init migrations 001–020, роли и named volume `course_postgres_data` |
-| `cli` | Одноразовый bootstrap: production CLI migrations 021–026, action manifests и workflow maps |
+| `cli` | Одноразовый bootstrap: production CLI migrations 021–028, action manifests и workflow maps |
 | `gateway` | Единственный опубликованный на host HTTP port; proxy к API |
 | `api` | JWT, schemas, generic `api.invoke`, receipts, diagnostics и SQL metrics snapshot |
 | `worker-a`, `worker-b` | Один C# image, конкурентные jobs, heartbeat и fencing |
@@ -94,7 +94,7 @@ Callback JWT из synthetic helper живёт два часа; обновите 
 
 ## Existing Week 3 volume → Week 4
 
-Используйте прежние `COMPOSE_PROJECT_NAME` и **прежние DB passwords**. Новый PostgreSQL image не выполняет init scripts на существующем volume. Администратор явно обновляет role grants, затем production CLI применяет только 021–026. Не удаляйте volume для upgrade.
+Используйте прежние `COMPOSE_PROJECT_NAME` и **прежние DB passwords**. Новый PostgreSQL image не выполняет init scripts на существующем volume. Администратор явно обновляет role grants, затем production CLI применяет forward migrations 021–028; на volume с 026 применяются только 027–028. Не удаляйте volume для upgrade.
 
 ```bash
 docker compose --env-file .env build postgres cli
@@ -106,7 +106,7 @@ docker compose --env-file .env exec -T postgres psql -U postgres -d course -Atc 
 docker compose --env-file .env up -d --build
 ```
 
-Второй `migration apply` возвращает `applied=0, skipped=6`; изменение checksum применённого файла вызывает conflict. `cli bootstrap` тоже безопасно повторяет 021–026 и публикацию. Init 001–020 уже выполнены и не передаются CLI повторно. Domain data и named volume сохраняются; history хранит шесть файлов 021–026. Role bootstrap идемпотентно восстанавливает grants.
+На fresh bootstrap первое применение 021–028 возвращает `applied=8, skipped=0`, повторное — `applied=0, skipped=8`; изменение checksum применённого файла вызывает conflict. `cli bootstrap` тоже безопасно повторяет 021–028 и публикацию. Init 001–020 уже выполнены и не передаются CLI повторно. Domain data и named volume сохраняются; history хранит восемь файлов 021–028. Role bootstrap идемпотентно восстанавливает grants.
 
 ```powershell
 $RepoPath = (Resolve-Path .).Path
@@ -169,9 +169,11 @@ Gateway, API, workers и Python observability используют internal 8080
 
 ## Lease, retry and recovery
 
-Job lease равен `COURSE_JOB_LEASE_MS` (test 2000 ms); task timeout к lease **не добавляется**. Живой worker продлевает его отдельной короткой transaction/connection, независимо от action transaction. Conditional update требует `LEASED`, owner, `leaseVersion` и неистёкший lease. Heartbeat не увеличивает `leaseVersion` и прекращается при timeout, finish или lease loss. После crash другой worker reclaim; fencing отклоняет stale finish/fail. `executionId` стабилен при повторах, attempt и lease version указывают текущую reservation.
+Job lease равен `COURSE_JOB_LEASE_MS` (test 2000 ms); task timeout к lease **не добавляется**. Живой worker продлевает его отдельной короткой transaction/connection, независимо от action transaction. `workflow.finish_job` и `workflow.fail_job` под row lock требуют `LEASED`, owner, `leaseVersion` и `lease_until > clock_timestamp()`; истёкший lease возвращает `workflow.lease_stale` даже до нового claim, без изменения job, attempts/history, retry state или предметного эффекта. Heartbeat не увеличивает `leaseVersion` и прекращается при timeout, finish или lease loss. После crash другой worker reclaim; fencing отклоняет stale finish/fail. `executionId` стабилен при повторах, attempt и lease version указывают текущую reservation.
 
 Outbox допускает четыре попытки **включая первую**. Первая сразу; test backoff: 200/400/800 ms плюс 0–100 ms jitter. SQL делит budget и lease между обеими dispatcher replicas. External request ID и exact body не меняются; provider idempotency сохраняет `paymentCount=1` даже после lost response. `DEAD` не значит `REJECTED`: operation остаётся `PROCESSING`, process — `WAITING_SIGNAL`. Поздний valid receipt продолжает chain, сохраняя `DEAD` evidence.
+
+Сценарий `restart-recovery` в `tests/week4_observability.py` проверяет полный Compose `down/up` с сохранением named PostgreSQL volume. Перед остановкой одновременно сохраняются READY job, workflow и Outbox `RETRY_WAIT`, `WAITING_SIGNAL`, `WAITING_MANUAL` и Inbox `RECEIVED`. Точные `next_attempt_at` сравниваются после подъёма PostgreSQL до запуска consumers; Worker и dispatcher проверяются на отсутствие раннего retry и ограниченное время подхвата после deadline. Проверка сверяет стабильные execution/request IDs, один предметный эффект, восстановление ожидающих состояний, health, metrics и diagnostics. Расширенный observability-прогон текущего candidate завершился 6/6 PASS.
 
 ## Health and OpenMetrics
 
@@ -198,7 +200,7 @@ curl -sS -X POST "http://$gateway_address/api/diagnostics/trace" \
   -d '{"identifier":"<operationId-or-other-supported-id>"}'
 ```
 
-`diagnostics.stalled` version 1 принимает только `{}`. Пустой `result` — `{"items":[]}`. Выборка: operation `PROCESSING`, process `WAITING_SIGNAL`, Outbox `DEAD`; строка содержит только `operationId`, `processId`, `externalRequestId`. Сортировка по `operationId`, без duplicate. Late receipt убирает chain из списка. Нет/неверный JWT → 401, нет scope → 403, лишнее поле → 422 `payload.invalid`.
+`diagnostics.stalled` version 1 принимает только `{}`. Пустой `result` — `{"items":[]}`. Выборка: operation `PROCESSING`, process `WAITING_SIGNAL`, Outbox `DEAD` не менее 30 секунд от сохранённого `dead_at`; строка содержит только `operationId`, `processId`, `externalRequestId`. Это порог ускоренного course profile; `updated_at` не подходит, поскольку меняется при других обновлениях Outbox и не обозначает начало ожидания после DEAD. Сортировка по `operationId`, без duplicate. Late receipt убирает chain из списка. Нет/неверный JWT → 401, нет scope → 403, лишнее поле → 422 `payload.invalid`.
 
 `diagnostics.trace` version 1 принимает один identifier из 11 типов: `correlationId`, `requestId`, `operationId`, `processId`, `stepInstanceId`, `jobId`, `executionId`, `attemptId`, `externalRequestId`, `messageId`, `decisionId`. `query.matchedBy` — array всех совпавших типов **одной** chain. Результат содержит ровно `query`, `dispatches`, `operation`, `operationEvents`, `process`, `steps`, `jobs`, `attempts`, `outbox`, `inbox`, `receipts`, `decisions`; массивы имеют детерминированный порядок времени/ID. Same-chain multi-match допустим; разные chains не объединяются, дают 409 `diagnostics.trace_ambiguous`. Unknown → 404 `diagnostics.trace_not_found`; invalid payload → 422. Нет payloads, headers, signatures, tokens, manual reason или raw errors. Формы полей задают `contracts/course-1/diagnostics-*.schema.json`.
 
@@ -209,7 +211,7 @@ curl -sS -X POST "http://$gateway_address/api/diagnostics/trace" \
 | Failpoint | Service | Transaction boundary | Recovery / evidence |
 |---|---|---|---|
 | `after_job_claim` | worker | Committed claim, до action | Expired lease, reclaim; job/attempt и stable execution ID |
-| `after_action_before_finish` | worker | Action committed, до finish | Reclaim и idempotent replay; один domain effect |
+| `after_action_before_finish` | worker | Action выполнен внутри незавершённой transaction, до finish и commit | Crash откатывает action; reclaim и replay дают один domain effect |
 | `after_outbox_claim` | dispatcher | Committed claim, до provider | Lease reclaim; один provider payment |
 | `after_provider_response` | dispatcher | Provider ответил, до SQL ack | Same ID/body retry; requests ≥2, paymentCount=1 |
 | `after_inbox_saved` | API | Inbox/receipt сохранены, до ответа | Replay callback; Inbox=1, receipt=1, SignalAccepted=1, SignalApplied=1 |
@@ -234,7 +236,7 @@ SQL example: `docker compose --env-file .env exec -T postgres psql -U postgres -
 
 ## Verification
 
-Подтверждённое evidence текущего рабочего дерева:
+Исторические результаты исходного submission `846e156cae8b56b804becf4763353ed95bcc0b2d` до исправлений 027–028:
 
 | Проверка | Результат |
 |---|---|
@@ -254,7 +256,29 @@ SQL example: `docker compose --env-file .env exec -T postgres psql -U postgres -
 | Week 2 regression | 10/10 |
 | Signal concurrency | 4/4 |
 
-После полного прогона менялись только cleanup-фрагменты `tests/week3_e2e.py` и `tests/signal_process_concurrency.py`: узкие проверки Week 3 success 1/1 и signal concurrency 4/4 прошли, новых Docker resources после cleanup — 0.
+Подтверждённые проверки текущего рабочего дерева `week4-review-fix` (включая migrations 027–028). Официальный checker запущен непосредственно на этом дереве; остальные suites прошли отдельными последовательными прогонами:
+
+| Проверка | Результат |
+|---|---|
+| Официальный Week 4 checker (reference `e1ae7e03c6a4f2da5dc2ee9f02ebe3f26b2d16a3`) | **139/139 PASS, non-passed=0, exit 0** |
+| Release build | PASS, 0 errors |
+| Worker LogicTests | 53/53 PASS |
+| Python perimeter | 28/28 PASS |
+| Week 4 observability | 6/6 PASS |
+| Week 4 SQL regression, включая `027_workflow_lease_expiry_fencing.sql` | 11/11 PASS |
+| diagnostics.stalled, `028_diagnostics_stalled_threshold.sql`, 30 секунд от durable `dead_at` | 8/8 PASS |
+| diagnostics.trace | 7/7 PASS |
+| Crash matrix | Первые пять сценариев PASS последовательно; `after_manual_decision` PASS отдельным узким прогоном после исправления readiness race. Все шесть имеют PASS evidence; единый 6/6 после последней harness-правки не запускался. |
+| Week 3 E2E | 6/6 PASS |
+| Week 2 regression | 10/10 PASS |
+| Signal concurrency | 4/4 PASS |
+| Existing-volume upgrade 026→027→028 | PASS |
+| Fresh bootstrap migrations 021–028 | `applied=8, skipped=0`; повтор `applied=0, skipped=8` |
+| Mixed full down/up restart | PASS: READY, оба `RETRY_WAIT`, `WAITING_SIGNAL`, `WAITING_MANUAL`, Inbox `RECEIVED`; retry не раньше сохранённых deadlines |
+| Cleanup последних exact projects | containers=0, volumes=0, networks=0, private image tags=0 |
+| Единый непрерывный `./check.sh` | PASS не подтверждён: внешние/environment failures, затем исправленный readiness race в crash-matrix harness. Pending относится только к непрерывному wrapper run, не к перечисленным функциональным проверкам. |
+
+Перед независимой проверкой исходного submission менялись только cleanup-фрагменты `tests/week3_e2e.py` и `tests/signal_process_concurrency.py`: узкие проверки Week 3 success 1/1 и signal concurrency 4/4 прошли, новых Docker resources после cleanup — 0.
 
 Одна каноническая команда из корня решения:
 
